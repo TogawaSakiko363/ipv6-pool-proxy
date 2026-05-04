@@ -1,0 +1,13 @@
+[package]
+name = "ipv6-pool-proxy"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "ipv6-pool-proxy"
+path = "main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+rand = "0.8"
+socket2 = { version = "0.5", features = ["all"] }
