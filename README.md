@@ -14,6 +14,7 @@
 - `dns` 模式内置 TCP 443 SNI Proxy，根据 TLS ClientHello 中的 SNI 识别目标域名并转发。
 - 支持 `domain.conf` 精确域名、后缀、关键词、TLD 规则。
 - 支持 `-ipv4_pass_through true|false`：目标只有 IPv4 时是否回落到本机默认 IPv4 出站。
+- 支持 `-w ip.conf` 入站 IP 白名单，作用于 SOCKS5、SNI Proxy 与 DNS UDP 三个入口；支持单 IP 与 CIDR、IPv4 与 IPv6 混写。
 
 ## 重要系统要求
 
@@ -104,7 +105,7 @@ target/release/ipv6-pool-proxy
 ## 命令行参数
 
 ```text
-Usage: ipv6-pool-proxy -m proxy|dns -l 0.0.0.0:1080 -u user:pass -p 2001:470:19:226::/64 [-c domain.conf] [-ipv4_pass_through true|false]
+Usage: ipv6-pool-proxy -m proxy|dns -l 0.0.0.0:1080 -u user:pass -p 2001:470:19:226::/64 [-c domain.conf] [-ipv4_pass_through true|false] [-w ip.conf]
 ```
 
 参数说明：
@@ -117,6 +118,7 @@ Usage: ipv6-pool-proxy -m proxy|dns -l 0.0.0.0:1080 -u user:pass -p 2001:470:19:
 | `-p`, `--prefix` | 必填 | 出站随机 IPv6 CIDR，例如 `2001:470:19:226::/64`。 |
 | `-c`, `--config` | 二进制同目录下的 `domain.conf` | `dns` 模式域名规则文件路径。 |
 | `-ipv4_pass_through`, `--ipv4_pass_through` | `false` | 当目标只有 IPv4 时，是否回落到本机默认 IPv4 出站。 |
+| `-w`, `--whitelist` | 无 | 入站 IP 白名单文件路径。未传时不启用白名单（允许所有 IP 连入）；传了则只放行命中的来源 IP。 |
 | `-h`, `--help` | 无 | 显示帮助信息。 |
 
 ## proxy 模式
@@ -217,6 +219,56 @@ tld:com
 | `keyword:google` | 域名包含关键词即命中 | `www.google.com`, `googleapis.com` | `example.com` |
 | `tld:com` | 匹配指定域名后缀 | `example.com`, `a.b.com` | `example.net` |
 
+## ip.conf 入站白名单
+
+通过 `-w ip.conf` 启用入站白名单。启用后，**只有命中白名单的来源 IP** 才能与本程序建立连接，作用范围覆盖：
+
+- `proxy` 模式的 SOCKS5 TCP 端口；
+- `dns` 模式的 SNI Proxy TCP 443 端口；
+- `dns` 模式的 UDP DNS 端口。
+
+未命中的来源连接会被立即关闭（TCP）或丢弃（UDP），程序不返回任何应用层应答，热路径不打日志。
+
+文件每行一条规则，支持 `#` 注释和空行。规则同时支持 IPv4 / IPv6 的单地址与 CIDR：
+
+```conf
+# 单 IPv4，等价于 1.1.1.1/32
+1.1.1.1
+
+# IPv4 CIDR
+1.1.1.0/24
+10.0.0.0/8
+
+# 单 IPv6，等价于 ::1/128
+::1
+
+# IPv6 CIDR
+2001:db8::/32
+
+# 任意 IPv6
+::/0
+```
+
+启动示例：
+
+```bash
+./ipv6-pool-proxy -m proxy -l 0.0.0.0:1080 -p 2001:db8:1234:5678::/64 -w /etc/ipv6-pool-proxy/ip.conf
+```
+
+启动日志会显示载入条目数，便于发现配置错误：
+
+```text
+... whitelist: enabled (4 entries)
+```
+
+注意：
+
+- **不传 `-w`** 等价于不启用白名单，所有来源 IP 均放行（保持旧行为）。
+- **传了 `-w` 但文件为空** 会启用白名单且 0 条目，此时**任何来源都会被拒绝**，程序不会自动放行 `127.0.0.1` 之类，需要显式写入白名单。
+- **`-w` 指定的文件不存在** 会启动失败，避免误以为生效。
+- 当 `-l` 监听地址是 `[::]` 这类双栈地址时，IPv4 客户端在内核层会以 `::ffff:1.2.3.4` 形式被 accept；程序内部已自动归一化为 `1.2.3.4`，因此白名单中**直接写 IPv4 地址即可**，无需写 v4-mapped IPv6 形式。
+- 白名单只控制"谁能连入"，不影响出站随机 IPv6 行为。
+
 ## systemd 示例
 
 以下示例仅供参考，请根据实际路径、用户、监听地址和 IPv6 前缀调整。
@@ -300,3 +352,12 @@ ip -6 neigh
 ```bash
 -ipv4_pass_through true
 ```
+
+### 启用白名单后客户端无法连接
+
+排查顺序：
+
+1. 查看启动日志中的 `whitelist: enabled (N entries)`，确认 N 不为 0；
+2. 客户端的真实出口 IP 是否在白名单中（NAT、CGNAT、IPv6 临时地址都可能让出口 IP 与你以为的不同）；
+3. 如果服务监听 `[::]`（双栈），客户端是 IPv4，白名单**直接写 IPv4 地址**即可，不要写成 `::ffff:1.2.3.4`；
+4. 白名单未命中时连接被静默关闭，不会有日志，可在服务器上用 `ss -tn`、`tcpdump` 或防火墙日志辅助验证连接是否到达本机。

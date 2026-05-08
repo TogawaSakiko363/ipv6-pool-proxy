@@ -32,6 +32,15 @@ struct Config {
     mode: Mode,
     domain_rules: DomainRules,
     ipv4_pass_through: bool,
+    whitelist: Option<IpWhitelist>,
+}
+
+impl Config {
+    fn allows(&self, ip: IpAddr) -> bool {
+        self.whitelist
+            .as_ref()
+            .map_or(true, |wl| wl.allows(ip))
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -189,6 +198,132 @@ fn prefix_mask(prefix_len: u8) -> u128 {
     }
 }
 
+fn ipv4_prefix_mask(prefix_len: u8) -> u32 {
+    if prefix_len == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix_len)
+    }
+}
+
+// Normalize ::ffff:a.b.c.d back to a.b.c.d so v4 whitelist entries work when
+// the listener is dual-stack ([::]:port).
+fn normalize_peer_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None => IpAddr::V6(v6),
+        },
+        v => v,
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct IpWhitelist {
+    // Each entry stores the network already masked, plus its prefix length.
+    v4: Vec<(u32, u8)>,
+    v6: Vec<(u128, u8)>,
+}
+
+impl IpWhitelist {
+    fn load(path: PathBuf) -> std::io::Result<Self> {
+        let content = fs::read_to_string(&path).map_err(|err| {
+            Error::new(
+                err.kind(),
+                format!("failed to read whitelist {}: {err}", path.display()),
+            )
+        })?;
+        Self::parse(&content)
+    }
+
+    fn parse(content: &str) -> std::io::Result<Self> {
+        let mut wl = Self::default();
+        for (index, raw_line) in content.lines().enumerate() {
+            let line = raw_line.split_once('#').map_or(raw_line, |(value, _)| value).trim();
+            if line.is_empty() {
+                continue;
+            }
+
+            let (addr_str, prefix_opt) = match line.split_once('/') {
+                Some((a, p)) => (a.trim(), Some(p.trim())),
+                None => (line, None),
+            };
+
+            let ip: IpAddr = addr_str.parse().map_err(|_| {
+                Error::new(
+                    ErrorKind::InvalidInput,
+                    format!("invalid IP at whitelist line {}: {}", index + 1, line),
+                )
+            })?;
+
+            match ip {
+                IpAddr::V4(v4) => {
+                    let prefix_len = match prefix_opt {
+                        Some(p) => p.parse::<u8>().map_err(|_| {
+                            Error::new(
+                                ErrorKind::InvalidInput,
+                                format!("invalid prefix at whitelist line {}: {}", index + 1, line),
+                            )
+                        })?,
+                        None => 32,
+                    };
+                    if prefix_len > 32 {
+                        return Err(Error::new(
+                            ErrorKind::InvalidInput,
+                            format!("v4 prefix length must be 0..=32 at whitelist line {}", index + 1),
+                        ));
+                    }
+                    let net = u32::from(v4) & ipv4_prefix_mask(prefix_len);
+                    wl.v4.push((net, prefix_len));
+                }
+                IpAddr::V6(v6) => {
+                    let prefix_len = match prefix_opt {
+                        Some(p) => p.parse::<u8>().map_err(|_| {
+                            Error::new(
+                                ErrorKind::InvalidInput,
+                                format!("invalid prefix at whitelist line {}: {}", index + 1, line),
+                            )
+                        })?,
+                        None => 128,
+                    };
+                    if prefix_len > 128 {
+                        return Err(Error::new(
+                            ErrorKind::InvalidInput,
+                            format!("v6 prefix length must be 0..=128 at whitelist line {}", index + 1),
+                        ));
+                    }
+                    let net = u128::from(v6) & prefix_mask(prefix_len);
+                    wl.v6.push((net, prefix_len));
+                }
+            }
+        }
+        Ok(wl)
+    }
+
+    fn allows(&self, ip: IpAddr) -> bool {
+        match normalize_peer_ip(ip) {
+            IpAddr::V4(v4) => {
+                let n = u32::from(v4);
+                self.v4.iter().any(|(net, prefix)| {
+                    let mask = ipv4_prefix_mask(*prefix);
+                    (n & mask) == *net
+                })
+            }
+            IpAddr::V6(v6) => {
+                let n = u128::from(v6);
+                self.v6.iter().any(|(net, prefix)| {
+                    let mask = prefix_mask(*prefix);
+                    (n & mask) == *net
+                })
+            }
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.v4.len() + self.v6.len()
+    }
+}
+
 fn invalid_input(message: &'static str) -> Error {
     Error::new(ErrorKind::InvalidInput, message)
 }
@@ -200,6 +335,7 @@ fn parse_args() -> std::io::Result<Config> {
     let mut mode = Mode::Proxy;
     let mut domain_config = None;
     let mut ipv4_pass_through = false;
+    let mut whitelist_path: Option<PathBuf> = None;
 
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -248,6 +384,12 @@ fn parse_args() -> std::io::Result<Config> {
                     .ok_or_else(|| invalid_input("missing value for -ipv4_pass_through/--ipv4_pass_through"))?;
                 ipv4_pass_through = parse_bool(&value)?;
             }
+            "-w" | "--whitelist" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| invalid_input("missing value for -w/--whitelist"))?;
+                whitelist_path = Some(PathBuf::from(value));
+            }
             "-h" | "--help" => {
                 print_usage();
                 std::process::exit(0);
@@ -273,6 +415,11 @@ fn parse_args() -> std::io::Result<Config> {
         DomainRules::default()
     };
 
+    let whitelist = match whitelist_path {
+        Some(path) => Some(IpWhitelist::load(path)?),
+        None => None,
+    };
+
     Ok(Config {
         listen,
         auth,
@@ -280,6 +427,7 @@ fn parse_args() -> std::io::Result<Config> {
         mode,
         domain_rules,
         ipv4_pass_through,
+        whitelist,
     })
 }
 
@@ -310,9 +458,10 @@ fn bind_tcp_listener(addr: SocketAddr) -> std::io::Result<TcpListener> {
 
 fn print_usage() {
     println!(
-        "Usage: ipv6-pool-proxy -m proxy|dns -l 0.0.0.0:1080 -u user:pass -p 2001:470:19:226::/64 [-c domain.conf] [-ipv4_pass_through true|false]\n\n\
-Options:\n  -m, --mode <proxy|dns>              Run mode, default: proxy\n  -l, --listen <addr:port>            Listen address, default: 0.0.0.0:1080\n  -u, --user <user:pass>              Enable SOCKS5 username/password authentication; ignored in dns mode\n  -p, --prefix <ipv6/cidr>            Required outbound random IPv6 CIDR, e.g. 2001:470:19:226::/64\n  -c, --config <path>                 dns mode domain.conf path, default: domain.conf next to binary\n  -ipv4_pass_through <true|false>     Fallback to local default IPv4 outbound when target only has IPv4, default: false\n\n\
-domain.conf examples:\n  google.com                 Hijack exact domain only\n  suffix:google.com          Hijack domain and all subdomains\n  keyword:google             Hijack domains containing keyword\n  tld:com                    Hijack all domains with this suffix"
+        "Usage: ipv6-pool-proxy -m proxy|dns -l 0.0.0.0:1080 -u user:pass -p 2001:470:19:226::/64 [-c domain.conf] [-ipv4_pass_through true|false] [-w ip.conf]\n\n\
+Options:\n  -m, --mode <proxy|dns>              Run mode, default: proxy\n  -l, --listen <addr:port>            Listen address, default: 0.0.0.0:1080\n  -u, --user <user:pass>              Enable SOCKS5 username/password authentication; ignored in dns mode\n  -p, --prefix <ipv6/cidr>            Required outbound random IPv6 CIDR, e.g. 2001:470:19:226::/64\n  -c, --config <path>                 dns mode domain.conf path, default: domain.conf next to binary\n  -ipv4_pass_through <true|false>     Fallback to local default IPv4 outbound when target only has IPv4, default: false\n  -w, --whitelist <path>              Inbound IP whitelist file; if omitted, all IPs are allowed\n\n\
+domain.conf examples:\n  google.com                 Hijack exact domain only\n  suffix:google.com          Hijack domain and all subdomains\n  keyword:google             Hijack domains containing keyword\n  tld:com                    Hijack all domains with this suffix\n\n\
+ip.conf examples:\n  1.1.1.1                    Single IPv4\n  1.1.1.0/24                 IPv4 CIDR\n  ::1                        Single IPv6\n  2001:db8::/32              IPv6 CIDR\n  # comments after '#' are ignored"
     );
 }
 
@@ -568,8 +717,12 @@ async fn run_accept_loop<F, Fut>(
             Err(_) => return,
         };
         match listener.accept().await {
-            Ok((client, _peer)) => {
+            Ok((client, peer)) => {
                 backoff_ms = 5;
+                if !config.allows(peer.ip()) {
+                    // Permit and client drop here, releasing both back.
+                    continue;
+                }
                 let _ = client.set_nodelay(true);
                 let cfg = Arc::clone(&config);
                 tokio::spawn(async move {
@@ -608,6 +761,9 @@ async fn start_dns_services(config: Arc<Config>) -> std::io::Result<()> {
         loop {
             match udp_socket.recv_from(&mut buf).await {
                 Ok((len, src)) => {
+                    if !udp_cfg.allows(src.ip()) {
+                        continue;
+                    }
                     let permit = match dns_sem.clone().acquire_owned().await {
                         Ok(p) => p,
                         Err(_) => return,
@@ -836,14 +992,20 @@ async fn handle_sni_connection(mut client: TcpStream, config: Arc<Config>) -> st
 async fn main() -> std::io::Result<()> {
     let config = Arc::new(parse_args().inspect_err(|_| print_usage())?);
 
+    let whitelist_state = match &config.whitelist {
+        Some(wl) => format!("enabled ({} entries)", wl.len()),
+        None => "disabled".to_string(),
+    };
+
     println!(
-        "IPv6 pool proxy starting on {}, mode: {:?}, auth: {}, prefix: {}/{}, ipv4_pass_through: {}",
+        "IPv6 pool proxy starting on {}, mode: {:?}, auth: {}, prefix: {}/{}, ipv4_pass_through: {}, whitelist: {}",
         config.listen,
         config.mode,
         if config.auth.is_some() { "enabled" } else { "disabled" },
         Ipv6Addr::from(config.prefix.network),
         config.prefix.prefix_len,
-        config.ipv4_pass_through
+        config.ipv4_pass_through,
+        whitelist_state
     );
 
     match config.mode {
