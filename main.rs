@@ -5,8 +5,24 @@ use std::io::{Error, ErrorKind};
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::io::{copy_bidirectional, AsyncReadExt, AsyncWriteExt};
+use std::time::Duration;
+use tokio::io::{copy_bidirectional_with_sizes, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{lookup_host, TcpListener, TcpSocket, TcpStream, UdpSocket};
+use tokio::sync::Semaphore;
+use tokio::time::timeout;
+
+// --- High-concurrency tunables ---
+// Keep per-connection footprint small and apply timeouts everywhere so a slow
+// or hung peer can never permanently consume a socket.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+const SNI_READ_TIMEOUT: Duration = Duration::from_secs(15);
+const UPSTREAM_DNS_TIMEOUT: Duration = Duration::from_secs(5);
+const COPY_BUF_SIZE: usize = 4 * 1024;          // per direction; ~8 KB/conn
+const MAX_INFLIGHT_PROXY: usize = 300_000;      // hard cap on in-flight TCP handlers
+const MAX_INFLIGHT_SNI: usize = 300_000;
+const MAX_INFLIGHT_DNS: usize = 50_000;         // hard cap on in-flight UDP DNS workers
+const ACCEPT_BACKOFF_MAX_MS: u64 = 1000;
 
 #[derive(Clone, Debug)]
 struct Config {
@@ -364,36 +380,54 @@ async fn connect_by_mode(target: TargetAddr, config: &Config) -> std::io::Result
 }
 
 async fn handle_client(mut client: TcpStream, config: Arc<Config>) -> std::io::Result<()> {
-    socks5_handshake(&mut client, config.auth.as_ref()).await?;
-    let target = read_socks5_request(&mut client).await?;
+    // Bound the entire SOCKS5 negotiation to a single timeout so slow / dead
+    // peers cannot park a socket indefinitely.
+    let target = timeout(HANDSHAKE_TIMEOUT, async {
+        socks5_handshake(&mut client, config.auth.as_ref()).await?;
+        read_socks5_request(&mut client).await
+    })
+    .await
+    .map_err(|_| Error::new(ErrorKind::TimedOut, "socks5 handshake timeout"))??;
 
-    match connect_by_mode(target, &config).await {
-        Ok(mut remote) => {
+    match timeout(CONNECT_TIMEOUT, connect_by_mode(target, &config)).await {
+        Ok(Ok(mut remote)) => {
             send_socks5_reply(&mut client, 0x00).await?;
-            let _ = copy_bidirectional(&mut client, &mut remote).await;
+            let _ = copy_bidirectional_with_sizes(
+                &mut client,
+                &mut remote,
+                COPY_BUF_SIZE,
+                COPY_BUF_SIZE,
+            )
+            .await;
             Ok(())
         }
-        Err(err) => {
+        Ok(Err(err)) => {
             let code = socks5_error_code(&err);
             let _ = send_socks5_reply(&mut client, code).await;
             Err(err)
+        }
+        Err(_) => {
+            let _ = send_socks5_reply(&mut client, 0x06).await;
+            Err(Error::new(ErrorKind::TimedOut, "connect timeout"))
         }
     }
 }
 
 async fn socks5_handshake(client: &mut TcpStream, auth: Option<&Auth>) -> std::io::Result<()> {
-    let ver = client.read_u8().await?;
-    if ver != 0x05 {
+    // Read VER + NMETHODS in one syscall, then methods in one more — instead
+    // of N+2 individual reads.
+    let mut head = [0u8; 2];
+    client.read_exact(&mut head).await?;
+    if head[0] != 0x05 {
         return Err(invalid_input("invalid SOCKS version"));
     }
-
-    let nmethods = client.read_u8().await? as usize;
+    let nmethods = head[1] as usize;
     if nmethods == 0 {
         return Err(invalid_input("SOCKS5 client sent no auth methods"));
     }
-
-    let mut methods = vec![0u8; nmethods];
-    client.read_exact(&mut methods).await?;
+    let mut methods = [0u8; 255];
+    client.read_exact(&mut methods[..nmethods]).await?;
+    let methods = &methods[..nmethods];
 
     match auth {
         Some(auth) => {
@@ -415,21 +449,25 @@ async fn socks5_handshake(client: &mut TcpStream, auth: Option<&Auth>) -> std::i
 }
 
 async fn username_password_auth(client: &mut TcpStream, auth: &Auth) -> std::io::Result<()> {
-    let ver = client.read_u8().await?;
-    if ver != 0x01 {
+    let mut head = [0u8; 2];
+    client.read_exact(&mut head).await?;
+    if head[0] != 0x01 {
         client.write_all(&[0x01, 0x01]).await?;
         return Err(invalid_input("invalid username/password auth version"));
     }
+    let ulen = head[1] as usize;
+    let mut ubuf = [0u8; 255];
+    client.read_exact(&mut ubuf[..ulen]).await?;
 
-    let ulen = client.read_u8().await? as usize;
-    let mut username = vec![0u8; ulen];
-    client.read_exact(&mut username).await?;
+    let mut plen_buf = [0u8; 1];
+    client.read_exact(&mut plen_buf).await?;
+    let plen = plen_buf[0] as usize;
+    let mut pbuf = [0u8; 255];
+    client.read_exact(&mut pbuf[..plen]).await?;
 
-    let plen = client.read_u8().await? as usize;
-    let mut password = vec![0u8; plen];
-    client.read_exact(&mut password).await?;
-
-    if username == auth.username && password == auth.password {
+    let username = &ubuf[..ulen];
+    let password = &pbuf[..plen];
+    if username == auth.username.as_slice() && password == auth.password.as_slice() {
         client.write_all(&[0x01, 0x00]).await
     } else {
         client.write_all(&[0x01, 0x01]).await?;
@@ -438,10 +476,9 @@ async fn username_password_auth(client: &mut TcpStream, auth: &Auth) -> std::io:
 }
 
 async fn read_socks5_request(client: &mut TcpStream) -> std::io::Result<TargetAddr> {
-    let ver = client.read_u8().await?;
-    let cmd = client.read_u8().await?;
-    let rsv = client.read_u8().await?;
-    let atyp = client.read_u8().await?;
+    let mut head = [0u8; 4];
+    client.read_exact(&mut head).await?;
+    let [ver, cmd, rsv, atyp] = head;
 
     if ver != 0x05 || rsv != 0x00 {
         return Err(invalid_input("invalid SOCKS5 request header"));
@@ -451,35 +488,39 @@ async fn read_socks5_request(client: &mut TcpStream) -> std::io::Result<TargetAd
         return Err(Error::new(ErrorKind::Unsupported, "only SOCKS5 CONNECT is supported"));
     }
 
-    let target = match atyp {
+    match atyp {
         0x01 => {
-            let mut octets = [0u8; 4];
-            client.read_exact(&mut octets).await?;
-            let port = client.read_u16().await?;
-            TargetAddr::Ip(SocketAddr::new(IpAddr::from(octets), port))
+            let mut tail = [0u8; 6];
+            client.read_exact(&mut tail).await?;
+            let octets = [tail[0], tail[1], tail[2], tail[3]];
+            let port = u16::from_be_bytes([tail[4], tail[5]]);
+            Ok(TargetAddr::Ip(SocketAddr::new(IpAddr::from(octets), port)))
         }
         0x03 => {
-            let len = client.read_u8().await? as usize;
-            let mut name = vec![0u8; len];
-            client.read_exact(&mut name).await?;
-            let port = client.read_u16().await?;
-            let domain = String::from_utf8(name)
-                .map_err(|_| invalid_input("SOCKS5 domain is not valid UTF-8"))?;
-            TargetAddr::Domain(domain, port)
+            let mut len_buf = [0u8; 1];
+            client.read_exact(&mut len_buf).await?;
+            let len = len_buf[0] as usize;
+            let mut tail = [0u8; 257];
+            client.read_exact(&mut tail[..len + 2]).await?;
+            let port = u16::from_be_bytes([tail[len], tail[len + 1]]);
+            let domain = std::str::from_utf8(&tail[..len])
+                .map_err(|_| invalid_input("SOCKS5 domain is not valid UTF-8"))?
+                .to_string();
+            Ok(TargetAddr::Domain(domain, port))
         }
         0x04 => {
+            let mut tail = [0u8; 18];
+            client.read_exact(&mut tail).await?;
             let mut octets = [0u8; 16];
-            client.read_exact(&mut octets).await?;
-            let port = client.read_u16().await?;
-            TargetAddr::Ip(SocketAddr::new(IpAddr::from(octets), port))
+            octets.copy_from_slice(&tail[..16]);
+            let port = u16::from_be_bytes([tail[16], tail[17]]);
+            Ok(TargetAddr::Ip(SocketAddr::new(IpAddr::from(octets), port)))
         }
         _ => {
             send_socks5_reply(client, 0x08).await?;
-            return Err(Error::new(ErrorKind::Unsupported, "unsupported SOCKS5 address type"));
+            Err(Error::new(ErrorKind::Unsupported, "unsupported SOCKS5 address type"))
         }
-    };
-
-    Ok(target)
+    }
 }
 
 async fn send_socks5_reply(client: &mut TcpStream, reply: u8) -> std::io::Result<()> {
@@ -503,6 +544,48 @@ fn socks5_error_code(err: &std::io::Error) -> u8 {
     }
 }
 
+// --- Resilient accept loop with bounded concurrency ---
+//
+// 1. acquire_owned() BEFORE accept() applies natural backpressure — if all
+//    permits are taken, accept() is delayed and the kernel listen backlog
+//    (65535) absorbs the burst, instead of us spawning unbounded tasks.
+// 2. accept() errors (EMFILE / WSAEMFILE / etc) are caught and retried with
+//    exponential backoff. NEVER let an accept error kill the server — that's
+//    the #1 cause of crashes around 1k concurrent.
+async fn run_accept_loop<F, Fut>(
+    listener: TcpListener,
+    sem: Arc<Semaphore>,
+    config: Arc<Config>,
+    handler: F,
+) where
+    F: Fn(TcpStream, Arc<Config>) -> Fut + Send + Sync + 'static + Copy,
+    Fut: std::future::Future<Output = std::io::Result<()>> + Send + 'static,
+{
+    let mut backoff_ms = 5u64;
+    loop {
+        let permit = match sem.clone().acquire_owned().await {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        match listener.accept().await {
+            Ok((client, _peer)) => {
+                backoff_ms = 5;
+                let _ = client.set_nodelay(true);
+                let cfg = Arc::clone(&config);
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    let _ = handler(client, cfg).await;
+                });
+            }
+            Err(_err) => {
+                drop(permit);
+                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                backoff_ms = backoff_ms.saturating_mul(2).min(ACCEPT_BACKOFF_MAX_MS);
+            }
+        }
+    }
+}
+
 // --- DNS + SNI proxy helpers (used in dns mode) ---
 async fn start_dns_services(config: Arc<Config>) -> std::io::Result<()> {
     let udp = Arc::new(UdpSocket::bind(config.listen).await?);
@@ -514,7 +597,10 @@ async fn start_dns_services(config: Arc<Config>) -> std::io::Result<()> {
         config.listen, sni_listen
     );
 
-    // UDP DNS loop: -l controls DNS listen address and port.
+    let dns_sem = Arc::new(Semaphore::new(MAX_INFLIGHT_DNS));
+    let sni_sem = Arc::new(Semaphore::new(MAX_INFLIGHT_SNI));
+
+    // UDP DNS loop — resilient: never break on errors.
     let udp_cfg = Arc::clone(&config);
     let udp_socket = Arc::clone(&udp);
     tokio::spawn(async move {
@@ -522,67 +608,62 @@ async fn start_dns_services(config: Arc<Config>) -> std::io::Result<()> {
         loop {
             match udp_socket.recv_from(&mut buf).await {
                 Ok((len, src)) => {
+                    let permit = match dns_sem.clone().acquire_owned().await {
+                        Ok(p) => p,
+                        Err(_) => return,
+                    };
                     let packet = buf[..len].to_vec();
                     let udp = Arc::clone(&udp_socket);
                     let cfg = Arc::clone(&udp_cfg);
                     tokio::spawn(async move {
-                        if let Err(e) = handle_udp_dns_query(packet, src, udp, cfg).await {
-                            eprintln!("dns udp handler error: {e}");
-                        }
+                        let _permit = permit;
+                        let _ = handle_udp_dns_query(packet, src, udp, cfg).await;
                     });
                 }
-                Err(err) => {
-                    eprintln!("udp recv error: {err}");
-                    break;
+                Err(_) => {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
                 }
             }
         }
     });
 
-    // TCP SNI proxy loop: dns mode always receives hijacked HTTPS traffic on TCP 443.
+    // TCP SNI accept loop — resilient with semaphore backpressure.
     let tcp_cfg = Arc::clone(&config);
     tokio::spawn(async move {
-        loop {
-            match tcp.accept().await {
-                Ok((stream, peer)) => {
-                    let _ = stream.set_nodelay(true);
-                    let cfg = Arc::clone(&tcp_cfg);
-                    tokio::spawn(async move {
-                        if let Err(e) = handle_sni_connection(stream, cfg).await {
-                            eprintln!("sni handler {peer} error: {e}");
-                        }
-                    });
-                }
-                Err(err) => {
-                    eprintln!("tcp accept error: {err}");
-                    break;
-                }
-            }
-        }
+        run_accept_loop(tcp, sni_sem, tcp_cfg, |stream, cfg| async move {
+            handle_sni_connection(stream, cfg).await
+        })
+        .await;
     });
 
     Ok(())
 }
 
-async fn handle_udp_dns_query(packet: Vec<u8>, src: std::net::SocketAddr, udp: Arc<UdpSocket>, config: Arc<Config>) -> std::io::Result<()> {
-    // Minimal DNS parser: support single-question queries, forward unmatched or incompatible queries to upstream (8.8.8.8:53)
+async fn handle_udp_dns_query(
+    packet: Vec<u8>,
+    src: SocketAddr,
+    udp: Arc<UdpSocket>,
+    config: Arc<Config>,
+) -> std::io::Result<()> {
     if packet.len() < 12 {
         return Ok(());
     }
     let qdcount = u16::from_be_bytes([packet[4], packet[5]]);
     if qdcount == 0 {
-        // nothing to do
         let _ = udp.send_to(&packet, src).await;
         return Ok(());
     }
-    // parse qname with a single reusable String and ASCII lowercase in-place.
     let mut idx = 12usize;
     let mut qname = String::with_capacity(128);
     while idx < packet.len() {
         let len = packet[idx] as usize;
         idx += 1;
-        if len == 0 { break; }
-        if idx + len > packet.len() { return Ok(()); }
+        if len == 0 {
+            break;
+        }
+        if idx + len > packet.len() {
+            return Ok(());
+        }
         if !qname.is_empty() {
             qname.push('.');
         }
@@ -595,8 +676,7 @@ async fn handle_udp_dns_query(packet: Vec<u8>, src: std::net::SocketAddr, udp: A
     if idx + 4 > packet.len() {
         return Ok(());
     }
-    let qtype = u16::from_be_bytes([packet[idx], packet[idx+1]]);
-    let _qclass = u16::from_be_bytes([packet[idx+2], packet[idx+3]]);
+    let qtype = u16::from_be_bytes([packet[idx], packet[idx + 1]]);
 
     if config.domain_rules.is_normalized_match(&qname) {
         let qend = idx + 4;
@@ -605,7 +685,6 @@ async fn handle_udp_dns_query(packet: Vec<u8>, src: std::net::SocketAddr, udp: A
         resp.extend_from_slice(&packet[12..qend]);
 
         if hijack_answer {
-            // answer: NAME pointer to offset 12 -> 0xC00C
             resp.extend_from_slice(&[0xC0, 0x0C]);
             match config.listen.ip() {
                 IpAddr::V4(ipv4) => {
@@ -629,18 +708,15 @@ async fn handle_udp_dns_query(packet: Vec<u8>, src: std::net::SocketAddr, udp: A
         return Ok(());
     }
 
-    // not matched: forward to upstream resolver and proxy the response back
-    let upstream = ("8.8.8.8", 53);
-    match UdpSocket::bind(("0.0.0.0", 0)).await {
-        Ok(s) => {
-            s.send_to(&packet, upstream).await.ok();
-            let mut buf = vec![0u8; 1500];
-            match s.recv_from(&mut buf).await {
-                Ok((n, _)) => { let _ = udp.send_to(&buf[..n], src).await; }
-                Err(e) => eprintln!("upstream recv error: {e}"),
+    // Forward to upstream resolver with a hard timeout so a black-holed query
+    // cannot pin a socket forever.
+    if let Ok(s) = UdpSocket::bind("0.0.0.0:0").await {
+        if s.send_to(&packet, "8.8.8.8:53").await.is_ok() {
+            let mut buf = [0u8; 1500];
+            if let Ok(Ok((n, _))) = timeout(UPSTREAM_DNS_TIMEOUT, s.recv_from(&mut buf)).await {
+                let _ = udp.send_to(&buf[..n], src).await;
             }
         }
-        Err(e) => eprintln!("failed to bind upstream udp: {e}"),
     }
 
     Ok(())
@@ -652,64 +728,52 @@ fn dns_query_type_matches_listen_ip(qtype: u16, listen_ip: IpAddr) -> bool {
 
 fn build_dns_response_header(query: &[u8], has_answer: bool) -> Vec<u8> {
     let mut resp = Vec::with_capacity(query.len() + 32);
-    resp.extend_from_slice(&query[0..2]); // transaction id
-    resp.extend_from_slice(&[0x81, 0x80]); // standard response, recursion available, no error
-    resp.extend_from_slice(&[0x00, 0x01]); // QDCOUNT = 1
-    resp.extend_from_slice(if has_answer { &[0x00, 0x01] } else { &[0x00, 0x00] }); // ANCOUNT
-    resp.extend_from_slice(&[0x00, 0x00]); // NSCOUNT
-    resp.extend_from_slice(&[0x00, 0x00]); // ARCOUNT
+    resp.extend_from_slice(&query[0..2]);
+    resp.extend_from_slice(&[0x81, 0x80]);
+    resp.extend_from_slice(&[0x00, 0x01]);
+    resp.extend_from_slice(if has_answer { &[0x00, 0x01] } else { &[0x00, 0x00] });
+    resp.extend_from_slice(&[0x00, 0x00]);
+    resp.extend_from_slice(&[0x00, 0x00]);
     resp
 }
 
 fn extract_sni_from_client_hello(buf: &[u8]) -> Option<String> {
-    // minimal TLS ClientHello/SNI parsing
-    // record header: 5 bytes
     if buf.len() < 5 { return None; }
-    if buf[0] != 0x16 { return None; } // handshake
-    // let _version = &buf[1..3];
-    let rec_len = u16::from_be_bytes([buf[3], buf[4]]) as usize;
-    if buf.len() < 5 + rec_len { /* maybe truncated but try anyway */ }
-    // handshake
+    if buf[0] != 0x16 { return None; }
+    let _rec_len = u16::from_be_bytes([buf[3], buf[4]]) as usize;
     if buf.len() < 6 { return None; }
     let mut idx = 5;
-    if buf[idx] != 0x01 { return None; } // ClientHello
+    if buf[idx] != 0x01 { return None; }
     if buf.len() < idx + 4 { return None; }
-    let _hs_len = ((buf[idx+1] as usize) << 16) | ((buf[idx+2] as usize) << 8) | (buf[idx+3] as usize);
     idx += 4;
-    // version (2) + random (32)
     if buf.len() < idx + 2 + 32 { return None; }
     idx += 2 + 32;
-    // session id
     if buf.len() < idx + 1 { return None; }
     let sid_len = buf[idx] as usize; idx += 1 + sid_len;
     if buf.len() < idx + 2 { return None; }
-    // cipher suites
-    let cs_len = u16::from_be_bytes([buf[idx], buf[idx+1]]) as usize; idx += 2 + cs_len;
+    let cs_len = u16::from_be_bytes([buf[idx], buf[idx + 1]]) as usize; idx += 2 + cs_len;
     if buf.len() < idx + 1 { return None; }
-    // compression
     let comp_len = buf[idx] as usize; idx += 1 + comp_len;
     if buf.len() < idx + 2 { return None; }
-    let ext_len = u16::from_be_bytes([buf[idx], buf[idx+1]]) as usize; idx += 2;
+    let ext_len = u16::from_be_bytes([buf[idx], buf[idx + 1]]) as usize; idx += 2;
     let mut ext_end = idx + ext_len;
     if buf.len() < ext_end { ext_end = buf.len(); }
     while idx + 4 <= ext_end {
-        let ext_type = u16::from_be_bytes([buf[idx], buf[idx+1]]);
-        let elen = u16::from_be_bytes([buf[idx+2], buf[idx+3]]) as usize;
+        let ext_type = u16::from_be_bytes([buf[idx], buf[idx + 1]]);
+        let elen = u16::from_be_bytes([buf[idx + 2], buf[idx + 3]]) as usize;
         idx += 4;
         if idx + elen > ext_end { break; }
         if ext_type == 0x0000 {
-            // server_name
             if elen < 2 { return None; }
-            let _list_len = u16::from_be_bytes([buf[idx], buf[idx+1]]) as usize;
             let mut subidx = idx + 2;
             let list_end = idx + elen;
             while subidx + 3 <= list_end {
                 let name_type = buf[subidx];
-                let name_len = u16::from_be_bytes([buf[subidx+1], buf[subidx+2]]) as usize;
+                let name_len = u16::from_be_bytes([buf[subidx + 1], buf[subidx + 2]]) as usize;
                 subidx += 3;
                 if subidx + name_len > list_end { break; }
                 if name_type == 0 {
-                    if let Ok(s) = std::str::from_utf8(&buf[subidx..subidx+name_len]) {
+                    if let Ok(s) = std::str::from_utf8(&buf[subidx..subidx + name_len]) {
                         return Some(s.to_ascii_lowercase());
                     } else { return None; }
                 }
@@ -722,43 +786,53 @@ fn extract_sni_from_client_hello(buf: &[u8]) -> Option<String> {
 }
 
 async fn handle_sni_connection(mut client: TcpStream, config: Arc<Config>) -> std::io::Result<()> {
-    client.set_nodelay(true)?;
-    // Read initial client bytes (ClientHello)
+    let _ = client.set_nodelay(true);
+
     let mut initial = [0u8; 4096];
-    let n = match client.read(&mut initial).await {
-        Ok(0) => return Ok(()),
-        Ok(n) => n,
-        Err(e) => return Err(e),
+    let n = match timeout(SNI_READ_TIMEOUT, client.read(&mut initial)).await {
+        Ok(Ok(0)) => return Ok(()),
+        Ok(Ok(n)) => n,
+        Ok(Err(e)) => return Err(e),
+        Err(_) => return Err(Error::new(ErrorKind::TimedOut, "SNI read timeout")),
     };
     let initial = &initial[..n];
-    let sni = extract_sni_from_client_hello(initial);
-    let target_domain = match sni {
+
+    let target_domain = match extract_sni_from_client_hello(initial) {
         Some(d) => d,
-        None => {
-            // cannot extract SNI; drop
-            return Ok(());
+        None => return Ok(()),
+    };
+
+    let connect_fut = async {
+        if config.domain_rules.is_match(&target_domain) {
+            connect_target(
+                TargetAddr::Domain(target_domain.clone(), 443),
+                config.prefix,
+                config.ipv4_pass_through,
+            )
+            .await
+        } else {
+            connect_direct(TargetAddr::Domain(target_domain.clone(), 443)).await
         }
     };
 
-    // Decide whether to route via IPv6 random or direct
-    let remote = if config.domain_rules.is_match(&target_domain) {
-        connect_target(TargetAddr::Domain(target_domain.clone(), 443), config.prefix, config.ipv4_pass_through).await
-    } else {
-        connect_direct(TargetAddr::Domain(target_domain.clone(), 443)).await
+    let mut remote_stream = match timeout(CONNECT_TIMEOUT, connect_fut).await {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => return Err(e),
+        Err(_) => return Err(Error::new(ErrorKind::TimedOut, "SNI connect timeout")),
     };
 
-    match remote {
-        Ok(mut remote_stream) => {
-            // forward initial bytes
-            remote_stream.write_all(initial).await?;
-            let _ = copy_bidirectional(&mut client, &mut remote_stream).await;
-            Ok(())
-        }
-        Err(e) => Err(e),
-    }
+    remote_stream.write_all(initial).await?;
+    let _ = copy_bidirectional_with_sizes(
+        &mut client,
+        &mut remote_stream,
+        COPY_BUF_SIZE,
+        COPY_BUF_SIZE,
+    )
+    .await;
+    Ok(())
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "multi_thread")]
 async fn main() -> std::io::Result<()> {
     let config = Arc::new(parse_args().inspect_err(|_| print_usage())?);
 
@@ -774,21 +848,15 @@ async fn main() -> std::io::Result<()> {
 
     match config.mode {
         Mode::Proxy => {
-            // start socks5 listener
             let listener = bind_tcp_listener(config.listen)?;
-            loop {
-                let (client, peer) = listener.accept().await?;
-                let _ = client.set_nodelay(true);
-                let config = Arc::clone(&config);
-                tokio::spawn(async move {
-                    if let Err(err) = handle_client(client, config).await {
-                        eprintln!("client {peer} error: {err}");
-                    }
-                });
-            }
+            let sem = Arc::new(Semaphore::new(MAX_INFLIGHT_PROXY));
+            run_accept_loop(listener, sem, Arc::clone(&config), |client, cfg| async move {
+                handle_client(client, cfg).await
+            })
+            .await;
+            Ok(())
         }
         Mode::Dns => {
-            // start DNS UDP server on -l and SNIPROXY on TCP 443 of the same listen IP
             start_dns_services(Arc::clone(&config)).await?;
             tokio::signal::ctrl_c().await?;
             Ok(())
