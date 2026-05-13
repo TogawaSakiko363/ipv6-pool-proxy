@@ -727,11 +727,14 @@ async fn run_accept_loop<F, Fut>(
                 let cfg = Arc::clone(&config);
                 tokio::spawn(async move {
                     let _permit = permit;
-                    let _ = handler(client, cfg).await;
+                    if let Err(err) = handler(client, cfg).await {
+                        eprintln!("[conn error] {err}");
+                    }
                 });
             }
-            Err(_err) => {
+            Err(err) => {
                 drop(permit);
+                eprintln!("[accept error] {err} (backoff {}ms)", backoff_ms);
                 tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
                 backoff_ms = backoff_ms.saturating_mul(2).min(ACCEPT_BACKOFF_MAX_MS);
             }
@@ -773,10 +776,13 @@ async fn start_dns_services(config: Arc<Config>) -> std::io::Result<()> {
                     let cfg = Arc::clone(&udp_cfg);
                     tokio::spawn(async move {
                         let _permit = permit;
-                        let _ = handle_udp_dns_query(packet, src, udp, cfg).await;
+                        if let Err(err) = handle_udp_dns_query(packet, src, udp, cfg).await {
+                            eprintln!("[dns error] {src}: {err}");
+                        }
                     });
                 }
-                Err(_) => {
+                Err(err) => {
+                    eprintln!("[udp recv error] {err}");
                     tokio::time::sleep(Duration::from_millis(50)).await;
                 }
             }
