@@ -23,10 +23,12 @@ const MAX_INFLIGHT_PROXY: usize = 300_000;      // hard cap on in-flight TCP han
 const MAX_INFLIGHT_SNI: usize = 300_000;
 const MAX_INFLIGHT_DNS: usize = 50_000;         // hard cap on in-flight UDP DNS workers
 const ACCEPT_BACKOFF_MAX_MS: u64 = 1000;
+// TLS record payload max is 16384; ClientHello sits in one record.
+const MAX_CLIENT_HELLO_LEN: usize = 16 * 1024 + 5;
 
 #[derive(Clone, Debug)]
 struct Config {
-    listen: SocketAddr,
+    listens: Vec<SocketAddr>,
     auth: Option<Auth>,
     prefix: Ipv6Prefix,
     mode: Mode,
@@ -329,7 +331,7 @@ fn invalid_input(message: &'static str) -> Error {
 }
 
 fn parse_args() -> std::io::Result<Config> {
-    let mut listen = String::from("0.0.0.0:1080");
+    let mut listen_strs: Vec<String> = Vec::new();
     let mut auth = None;
     let mut prefix = None;
     let mut mode = Mode::Proxy;
@@ -341,9 +343,10 @@ fn parse_args() -> std::io::Result<Config> {
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "-l" | "--listen" => {
-                listen = args
+                let value = args
                     .next()
                     .ok_or_else(|| invalid_input("missing value for -l/--listen"))?;
+                listen_strs.push(value);
             }
             "-u" | "--user" => {
                 let value = args
@@ -403,9 +406,22 @@ fn parse_args() -> std::io::Result<Config> {
         }
     }
 
-    let listen = listen
-        .parse()
-        .map_err(|_| invalid_input("invalid listen address, e.g. 0.0.0.0:1080"))?;
+    if listen_strs.is_empty() {
+        listen_strs.push(String::from("0.0.0.0:1080"));
+    }
+    let mut listens: Vec<SocketAddr> = Vec::with_capacity(listen_strs.len());
+    for s in &listen_strs {
+        let addr: SocketAddr = s
+            .parse()
+            .map_err(|_| invalid_input("invalid listen address, e.g. 0.0.0.0:1080"))?;
+        if listens.contains(&addr) {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                format!("duplicate -l/--listen address: {addr}"),
+            ));
+        }
+        listens.push(addr);
+    }
     let prefix = prefix.ok_or_else(|| invalid_input("missing required -p/--prefix IPv6 CIDR"))?;
     let domain_rules = if mode == Mode::Dns {
         let path = domain_config.unwrap_or_else(default_domain_config_path);
@@ -421,7 +437,7 @@ fn parse_args() -> std::io::Result<Config> {
     };
 
     Ok(Config {
-        listen,
+        listens,
         auth,
         prefix,
         mode,
@@ -458,8 +474,9 @@ fn bind_tcp_listener(addr: SocketAddr) -> std::io::Result<TcpListener> {
 
 fn print_usage() {
     println!(
-        "Usage: ipv6-pool-proxy -m proxy|dns -l 0.0.0.0:1080 -u user:pass -p 2001:470:19:226::/64 [-c domain.conf] [-ipv4_pass_through true|false] [-w ip.conf]\n\n\
-Options:\n  -m, --mode <proxy|dns>              Run mode, default: proxy\n  -l, --listen <addr:port>            Listen address, default: 0.0.0.0:1080\n  -u, --user <user:pass>              Enable SOCKS5 username/password authentication; ignored in dns mode\n  -p, --prefix <ipv6/cidr>            Required outbound random IPv6 CIDR, e.g. 2001:470:19:226::/64\n  -c, --config <path>                 dns mode domain.conf path, default: domain.conf next to binary\n  -ipv4_pass_through <true|false>     Fallback to local default IPv4 outbound when target only has IPv4, default: false\n  -w, --whitelist <path>              Inbound IP whitelist file; if omitted, all IPs are allowed\n\n\
+        "Usage: ipv6-pool-proxy -m proxy|dns -l <addr:port> [-l <addr:port> ...] -u user:pass -p 2001:470:19:226::/64 [-c domain.conf] [-ipv4_pass_through true|false] [-w ip.conf]\n\n\
+Options:\n  -m, --mode <proxy|dns>              Run mode, default: proxy\n  -l, --listen <addr:port>            Listen address (repeat for dual-stack), default: 0.0.0.0:1080\n  -u, --user <user:pass>              Enable SOCKS5 username/password authentication; ignored in dns mode\n  -p, --prefix <ipv6/cidr>            Required outbound random IPv6 CIDR, e.g. 2001:470:19:226::/64\n  -c, --config <path>                 dns mode domain.conf path, default: domain.conf next to binary\n  -ipv4_pass_through <true|false>     Fallback to local default IPv4 outbound when target only has IPv4, default: false\n  -w, --whitelist <path>              Inbound IP whitelist file; if omitted, all IPs are allowed\n\n\
+Dual-stack listen example:\n  ipv6-pool-proxy -m dns -l 1.2.3.4:53 -l [2001:db8::1]:53 -p 2001:db8:abcd::/48 -c domain.conf\n  (A query hits the v4 socket and gets A; AAAA hits the v6 socket and gets AAAA; cross-stack queries return empty NOERROR (NODATA))\n\n\
 domain.conf examples:\n  google.com                 Hijack exact domain only\n  suffix:google.com          Hijack domain and all subdomains\n  keyword:google             Hijack domains containing keyword\n  tld:com                    Hijack all domains with this suffix\n\n\
 ip.conf examples:\n  1.1.1.1                    Single IPv4\n  1.1.1.0/24                 IPv4 CIDR\n  ::1                        Single IPv6\n  2001:db8::/32              IPv6 CIDR\n  # comments after '#' are ignored"
     );
@@ -720,6 +737,7 @@ async fn run_accept_loop<F, Fut>(
             Ok((client, peer)) => {
                 backoff_ms = 5;
                 if !config.allows(peer.ip()) {
+                    eprintln!("[whitelist deny tcp] {peer}");
                     // Permit and client drop here, releasing both back.
                     continue;
                 }
@@ -743,60 +761,70 @@ async fn run_accept_loop<F, Fut>(
 }
 
 // --- DNS + SNI proxy helpers (used in dns mode) ---
+// One UDP DNS + TCP 443 SNI listener pair per -l address. Each socket's local
+// IP is what we put in the DNS hijack answer, so an IPv4 client hitting the v4
+// socket gets an A record, an IPv6 client hitting the v6 socket gets AAAA.
 async fn start_dns_services(config: Arc<Config>) -> std::io::Result<()> {
-    let udp = Arc::new(UdpSocket::bind(config.listen).await?);
-    let sni_listen = SocketAddr::new(config.listen.ip(), 443);
-    let tcp = bind_tcp_listener(sni_listen)?;
-
-    println!(
-        "dns mode: DNS UDP listening on {}, SNI proxy TCP listening on {}",
-        config.listen, sni_listen
-    );
-
     let dns_sem = Arc::new(Semaphore::new(MAX_INFLIGHT_DNS));
     let sni_sem = Arc::new(Semaphore::new(MAX_INFLIGHT_SNI));
 
-    // UDP DNS loop — resilient: never break on errors.
-    let udp_cfg = Arc::clone(&config);
-    let udp_socket = Arc::clone(&udp);
-    tokio::spawn(async move {
-        let mut buf = vec![0u8; 1500];
-        loop {
-            match udp_socket.recv_from(&mut buf).await {
-                Ok((len, src)) => {
-                    if !udp_cfg.allows(src.ip()) {
-                        continue;
-                    }
-                    let permit = match dns_sem.clone().acquire_owned().await {
-                        Ok(p) => p,
-                        Err(_) => return,
-                    };
-                    let packet = buf[..len].to_vec();
-                    let udp = Arc::clone(&udp_socket);
-                    let cfg = Arc::clone(&udp_cfg);
-                    tokio::spawn(async move {
-                        let _permit = permit;
-                        if let Err(err) = handle_udp_dns_query(packet, src, udp, cfg).await {
-                            eprintln!("[dns error] {src}: {err}");
+    for listen in &config.listens {
+        let udp = Arc::new(UdpSocket::bind(*listen).await?);
+        let sni_listen = SocketAddr::new(listen.ip(), 443);
+        let tcp = bind_tcp_listener(sni_listen)?;
+        let listen_ip = listen.ip();
+
+        println!(
+            "dns mode: DNS UDP listening on {}, SNI proxy TCP listening on {}",
+            listen, sni_listen
+        );
+
+        // UDP DNS loop — resilient: never break on errors.
+        let udp_cfg = Arc::clone(&config);
+        let udp_sem = Arc::clone(&dns_sem);
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 1500];
+            loop {
+                match udp.recv_from(&mut buf).await {
+                    Ok((len, src)) => {
+                        if !udp_cfg.allows(src.ip()) {
+                            eprintln!("[whitelist deny udp] {src}");
+                            continue;
                         }
-                    });
-                }
-                Err(err) => {
-                    eprintln!("[udp recv error] {err}");
-                    tokio::time::sleep(Duration::from_millis(50)).await;
+                        let permit = match udp_sem.clone().acquire_owned().await {
+                            Ok(p) => p,
+                            Err(_) => return,
+                        };
+                        let packet = buf[..len].to_vec();
+                        let udp2 = Arc::clone(&udp);
+                        let cfg = Arc::clone(&udp_cfg);
+                        tokio::spawn(async move {
+                            let _permit = permit;
+                            if let Err(err) =
+                                handle_udp_dns_query(packet, src, udp2, listen_ip, cfg).await
+                            {
+                                eprintln!("[dns error] {src}: {err}");
+                            }
+                        });
+                    }
+                    Err(err) => {
+                        eprintln!("[udp recv error on {listen_ip}] {err}");
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
                 }
             }
-        }
-    });
+        });
 
-    // TCP SNI accept loop — resilient with semaphore backpressure.
-    let tcp_cfg = Arc::clone(&config);
-    tokio::spawn(async move {
-        run_accept_loop(tcp, sni_sem, tcp_cfg, |stream, cfg| async move {
-            handle_sni_connection(stream, cfg).await
-        })
-        .await;
-    });
+        // TCP SNI accept loop — resilient with semaphore backpressure.
+        let tcp_cfg = Arc::clone(&config);
+        let tcp_sem = Arc::clone(&sni_sem);
+        tokio::spawn(async move {
+            run_accept_loop(tcp, tcp_sem, tcp_cfg, |stream, cfg| async move {
+                handle_sni_connection(stream, cfg).await
+            })
+            .await;
+        });
+    }
 
     Ok(())
 }
@@ -805,6 +833,7 @@ async fn handle_udp_dns_query(
     packet: Vec<u8>,
     src: SocketAddr,
     udp: Arc<UdpSocket>,
+    listen_ip: IpAddr,
     config: Arc<Config>,
 ) -> std::io::Result<()> {
     if packet.len() < 12 {
@@ -842,13 +871,17 @@ async fn handle_udp_dns_query(
 
     if config.domain_rules.is_normalized_match(&qname) {
         let qend = idx + 4;
-        let hijack_answer = dns_query_type_matches_listen_ip(qtype, config.listen.ip());
+        let hijack_answer = dns_query_type_matches_listen_ip(qtype, listen_ip);
+        // For matched-but-wrong-stack queries return NOERROR with empty answer
+        // (NODATA), not NXDOMAIN: musl libc treats NXDOMAIN on any family as
+        // fatal and drops the other family's answer, breaking dual-stack
+        // clients.
         let mut resp = build_dns_response_header(&packet, hijack_answer);
         resp.extend_from_slice(&packet[12..qend]);
 
         if hijack_answer {
             resp.extend_from_slice(&[0xC0, 0x0C]);
-            match config.listen.ip() {
+            match listen_ip {
                 IpAddr::V4(ipv4) => {
                     resp.extend_from_slice(&[0x00, 0x01]); // A
                     resp.extend_from_slice(&[0x00, 0x01]); // IN
@@ -947,25 +980,84 @@ fn extract_sni_from_client_hello(buf: &[u8]) -> Option<String> {
     None
 }
 
+// A single read() can return only the first TCP segment, which truncates large
+// TLS 1.3 ClientHellos (PQ key shares, GREASE, big ALPN). Loop until we have
+// the full 5 + record_len bytes so SNI parsing and ClientHello forwarding to
+// upstream are both correct.
+async fn read_tls_client_hello(client: &mut TcpStream) -> std::io::Result<Vec<u8>> {
+    let mut buf: Vec<u8> = Vec::with_capacity(2048);
+    let mut chunk = [0u8; 4096];
+
+    while buf.len() < 5 {
+        let n = client.read(&mut chunk).await?;
+        if n == 0 {
+            return Err(Error::new(
+                ErrorKind::UnexpectedEof,
+                format!("eof before TLS record header (got {} bytes)", buf.len()),
+            ));
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    }
+    if buf[0] != 0x16 {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            format!("not a TLS handshake record (first byte=0x{:02x})", buf[0]),
+        ));
+    }
+    let need = 5 + u16::from_be_bytes([buf[3], buf[4]]) as usize;
+    if need > MAX_CLIENT_HELLO_LEN {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            format!("TLS record length {} exceeds cap", need - 5),
+        ));
+    }
+    while buf.len() < need {
+        let n = client.read(&mut chunk).await?;
+        if n == 0 {
+            return Err(Error::new(
+                ErrorKind::UnexpectedEof,
+                format!("eof at {}/{} bytes of ClientHello", buf.len(), need),
+            ));
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    }
+    Ok(buf)
+}
+
 async fn handle_sni_connection(mut client: TcpStream, config: Arc<Config>) -> std::io::Result<()> {
     let _ = client.set_nodelay(true);
+    let peer = client
+        .peer_addr()
+        .map_or_else(|_| "?".to_string(), |a| a.to_string());
 
-    let mut initial = [0u8; 4096];
-    let n = match timeout(SNI_READ_TIMEOUT, client.read(&mut initial)).await {
-        Ok(Ok(0)) => return Ok(()),
-        Ok(Ok(n)) => n,
-        Ok(Err(e)) => return Err(e),
-        Err(_) => return Err(Error::new(ErrorKind::TimedOut, "SNI read timeout")),
+    let initial = match timeout(SNI_READ_TIMEOUT, read_tls_client_hello(&mut client)).await {
+        Ok(Ok(buf)) => buf,
+        Ok(Err(e)) => {
+            eprintln!("[sni read] {peer}: {e}");
+            return Err(e);
+        }
+        Err(_) => {
+            eprintln!("[sni read] {peer}: timeout after {:?}", SNI_READ_TIMEOUT);
+            return Err(Error::new(ErrorKind::TimedOut, "SNI read timeout"));
+        }
     };
-    let initial = &initial[..n];
 
-    let target_domain = match extract_sni_from_client_hello(initial) {
+    let target_domain = match extract_sni_from_client_hello(&initial) {
         Some(d) => d,
-        None => return Ok(()),
+        None => {
+            let head_len = initial.len().min(16);
+            eprintln!(
+                "[sni parse] {peer}: failed, read {} bytes, head={:02x?}",
+                initial.len(),
+                &initial[..head_len]
+            );
+            return Ok(());
+        }
     };
 
+    let matched = config.domain_rules.is_match(&target_domain);
     let connect_fut = async {
-        if config.domain_rules.is_match(&target_domain) {
+        if matched {
             connect_target(
                 TargetAddr::Domain(target_domain.clone(), 443),
                 config.prefix,
@@ -979,11 +1071,20 @@ async fn handle_sni_connection(mut client: TcpStream, config: Arc<Config>) -> st
 
     let mut remote_stream = match timeout(CONNECT_TIMEOUT, connect_fut).await {
         Ok(Ok(s)) => s,
-        Ok(Err(e)) => return Err(e),
-        Err(_) => return Err(Error::new(ErrorKind::TimedOut, "SNI connect timeout")),
+        Ok(Err(e)) => {
+            eprintln!("[sni connect] {peer} -> {target_domain} (matched={matched}): {e}");
+            return Err(e);
+        }
+        Err(_) => {
+            eprintln!("[sni connect] {peer} -> {target_domain} (matched={matched}): timeout");
+            return Err(Error::new(ErrorKind::TimedOut, "SNI connect timeout"));
+        }
     };
 
-    remote_stream.write_all(initial).await?;
+    if let Err(e) = remote_stream.write_all(&initial).await {
+        eprintln!("[sni forward] {peer} -> {target_domain}: {e}");
+        return Err(e);
+    }
     let _ = copy_bidirectional_with_sizes(
         &mut client,
         &mut remote_stream,
@@ -1003,9 +1104,16 @@ async fn main() -> std::io::Result<()> {
         None => "disabled".to_string(),
     };
 
+    let listens_str = config
+        .listens
+        .iter()
+        .map(|a| a.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+
     println!(
-        "IPv6 pool proxy starting on {}, mode: {:?}, auth: {}, prefix: {}/{}, ipv4_pass_through: {}, whitelist: {}",
-        config.listen,
+        "IPv6 pool proxy starting on [{}], mode: {:?}, auth: {}, prefix: {}/{}, ipv4_pass_through: {}, whitelist: {}",
+        listens_str,
         config.mode,
         if config.auth.is_some() { "enabled" } else { "disabled" },
         Ipv6Addr::from(config.prefix.network),
@@ -1014,14 +1122,34 @@ async fn main() -> std::io::Result<()> {
         whitelist_state
     );
 
+    if config.mode == Mode::Dns {
+        for l in &config.listens {
+            if l.ip().is_unspecified() {
+                eprintln!(
+                    "[warn] dns mode: listener {l} uses a wildcard IP; \
+DNS hijack answers will return {} which is not connectable. \
+Bind to a specific routable IP per stack.",
+                    l.ip()
+                );
+            }
+        }
+    }
+
     match config.mode {
         Mode::Proxy => {
-            let listener = bind_tcp_listener(config.listen)?;
             let sem = Arc::new(Semaphore::new(MAX_INFLIGHT_PROXY));
-            run_accept_loop(listener, sem, Arc::clone(&config), |client, cfg| async move {
-                handle_client(client, cfg).await
-            })
-            .await;
+            for listen in &config.listens {
+                let listener = bind_tcp_listener(*listen)?;
+                let sem = Arc::clone(&sem);
+                let cfg = Arc::clone(&config);
+                tokio::spawn(async move {
+                    run_accept_loop(listener, sem, cfg, |client, cfg| async move {
+                        handle_client(client, cfg).await
+                    })
+                    .await;
+                });
+            }
+            tokio::signal::ctrl_c().await?;
             Ok(())
         }
         Mode::Dns => {
