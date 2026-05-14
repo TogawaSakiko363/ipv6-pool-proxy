@@ -727,20 +727,25 @@ async fn run_accept_loop<F, Fut>(
     F: Fn(TcpStream, Arc<Config>) -> Fut + Send + Sync + 'static + Copy,
     Fut: std::future::Future<Output = std::io::Result<()>> + Send + 'static,
 {
+    // accept() FIRST, then acquire permit — this way the kernel backlog keeps
+    // draining even when we're at capacity, and excess connections get an
+    // immediate RST instead of silently queuing behind a blocked accept().
     let mut backoff_ms = 5u64;
     loop {
-        let permit = match sem.clone().acquire_owned().await {
-            Ok(p) => p,
-            Err(_) => return,
-        };
         match listener.accept().await {
             Ok((client, peer)) => {
                 backoff_ms = 5;
                 if !config.allows(peer.ip()) {
                     eprintln!("[whitelist deny tcp] {peer}");
-                    // Permit and client drop here, releasing both back.
-                    continue;
+                    continue; // client drops → RST sent
                 }
+                let permit = match sem.clone().try_acquire_owned() {
+                    Ok(p) => p,
+                    Err(_) => {
+                        eprintln!("[overload] dropping connection from {peer}");
+                        continue; // client drops → RST sent
+                    }
+                };
                 let _ = client.set_nodelay(true);
                 let cfg = Arc::clone(&config);
                 tokio::spawn(async move {
@@ -751,7 +756,6 @@ async fn run_accept_loop<F, Fut>(
                 });
             }
             Err(err) => {
-                drop(permit);
                 eprintln!("[accept error] {err} (backoff {}ms)", backoff_ms);
                 tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
                 backoff_ms = backoff_ms.saturating_mul(2).min(ACCEPT_BACKOFF_MAX_MS);
@@ -985,42 +989,31 @@ fn extract_sni_from_client_hello(buf: &[u8]) -> Option<String> {
 // the full 5 + record_len bytes so SNI parsing and ClientHello forwarding to
 // upstream are both correct.
 async fn read_tls_client_hello(client: &mut TcpStream) -> std::io::Result<Vec<u8>> {
-    let mut buf: Vec<u8> = Vec::with_capacity(2048);
-    let mut chunk = [0u8; 4096];
+    // Read exactly the 5-byte TLS record header first.
+    let mut header = [0u8; 5];
+    client.read_exact(&mut header).await?;
 
-    while buf.len() < 5 {
-        let n = client.read(&mut chunk).await?;
-        if n == 0 {
-            return Err(Error::new(
-                ErrorKind::UnexpectedEof,
-                format!("eof before TLS record header (got {} bytes)", buf.len()),
-            ));
-        }
-        buf.extend_from_slice(&chunk[..n]);
-    }
-    if buf[0] != 0x16 {
+    if header[0] != 0x16 {
         return Err(Error::new(
             ErrorKind::InvalidData,
-            format!("not a TLS handshake record (first byte=0x{:02x})", buf[0]),
+            format!("not a TLS handshake record (first byte=0x{:02x})", header[0]),
         ));
     }
-    let need = 5 + u16::from_be_bytes([buf[3], buf[4]]) as usize;
+
+    let record_len = u16::from_be_bytes([header[3], header[4]]) as usize;
+    let need = 5 + record_len;
     if need > MAX_CLIENT_HELLO_LEN {
         return Err(Error::new(
             ErrorKind::InvalidData,
-            format!("TLS record length {} exceeds cap", need - 5),
+            format!("TLS record length {} exceeds cap", record_len),
         ));
     }
-    while buf.len() < need {
-        let n = client.read(&mut chunk).await?;
-        if n == 0 {
-            return Err(Error::new(
-                ErrorKind::UnexpectedEof,
-                format!("eof at {}/{} bytes of ClientHello", buf.len(), need),
-            ));
-        }
-        buf.extend_from_slice(&chunk[..n]);
-    }
+
+    // Allocate exactly `need` bytes and fill the payload portion precisely —
+    // no over-read, so subsequent TLS records remain untouched in the socket.
+    let mut buf = vec![0u8; need];
+    buf[..5].copy_from_slice(&header);
+    client.read_exact(&mut buf[5..]).await?;
     Ok(buf)
 }
 
