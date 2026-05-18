@@ -1,4 +1,3 @@
-use rand::Rng;
 use std::env;
 use std::fs;
 use std::io::{Error, ErrorKind};
@@ -187,7 +186,7 @@ impl Ipv6Prefix {
     fn random_addr(self) -> Ipv6Addr {
         let mask = prefix_mask(self.prefix_len);
         let host_mask = !mask;
-        let random_host = rand::thread_rng().gen::<u128>() & host_mask;
+        let random_host = rand::random::<u128>() & host_mask;
         Ipv6Addr::from(self.network | random_host)
     }
 }
