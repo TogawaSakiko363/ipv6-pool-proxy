@@ -1,3 +1,5 @@
+use arc_swap::ArcSwap;
+use rand::Rng;
 use std::env;
 use std::fs;
 use std::io::{Error, ErrorKind};
@@ -7,6 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{copy_bidirectional_with_sizes, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{lookup_host, TcpListener, TcpSocket, TcpStream, UdpSocket};
+use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::Semaphore;
 use tokio::time::timeout;
 
@@ -25,23 +28,44 @@ const ACCEPT_BACKOFF_MAX_MS: u64 = 1000;
 // TLS record payload max is 16384; ClientHello sits in one record.
 const MAX_CLIENT_HELLO_LEN: usize = 16 * 1024 + 5;
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct Config {
     listens: Vec<SocketAddr>,
     socks5_listens: Vec<SocketAddr>,
     auth: Option<Auth>,
     prefix: Ipv6Prefix,
     mode: Mode,
-    domain_rules: DomainRules,
     ipv4_pass_through: bool,
+    // Paths kept so SIGHUP can re-read the files; both are optional because
+    // domain rules only apply to dns mode and whitelist is opt-in.
+    domain_config_path: Option<PathBuf>,
+    whitelist_path: Option<PathBuf>,
+    // File-backed state that can change at runtime via SIGHUP. Hot-path code
+    // does config.hot.load() once per task; reload is lock-free via ArcSwap.
+    hot: ArcSwap<HotConfig>,
+}
+
+#[derive(Debug, Default)]
+struct HotConfig {
+    domain_rules: DomainRules,
     whitelist: Option<IpWhitelist>,
 }
 
 impl Config {
     fn allows(&self, ip: IpAddr) -> bool {
-        self.whitelist
+        self.hot
+            .load()
+            .whitelist
             .as_ref()
             .map_or(true, |wl| wl.allows(ip))
+    }
+
+    fn matches_domain(&self, domain: &str) -> bool {
+        self.hot.load().domain_rules.is_match(domain)
+    }
+
+    fn matches_normalized(&self, qname: &str) -> bool {
+        self.hot.load().domain_rules.is_normalized_match(qname)
     }
 }
 
@@ -445,11 +469,14 @@ fn parse_args() -> std::io::Result<Config> {
     }
 
     let prefix = prefix.ok_or_else(|| invalid_input("missing required -p/--prefix IPv6 CIDR"))?;
-    let domain_rules = if mode == Mode::Dns {
-        let path = domain_config.unwrap_or_else(default_domain_config_path);
-        DomainRules::load(path)?
+    let domain_config_path = if mode == Mode::Dns {
+        Some(domain_config.unwrap_or_else(default_domain_config_path))
     } else {
-        DomainRules::default()
+        None
+    };
+    let domain_rules = match &domain_config_path {
+        Some(p) => DomainRules::load(p.clone())?,
+        None => DomainRules::default(),
     };
 
     // Auth only applies to SOCKS5 listeners. Strip it if there's nothing for
@@ -459,8 +486,8 @@ fn parse_args() -> std::io::Result<Config> {
         auth = None;
     }
 
-    let whitelist = match whitelist_path {
-        Some(path) => Some(IpWhitelist::load(path)?),
+    let whitelist = match &whitelist_path {
+        Some(path) => Some(IpWhitelist::load(path.clone())?),
         None => None,
     };
 
@@ -470,9 +497,13 @@ fn parse_args() -> std::io::Result<Config> {
         auth,
         prefix,
         mode,
-        domain_rules,
         ipv4_pass_through,
-        whitelist,
+        domain_config_path,
+        whitelist_path,
+        hot: ArcSwap::from_pointee(HotConfig {
+            domain_rules,
+            whitelist,
+        }),
     })
 }
 
@@ -895,7 +926,7 @@ async fn handle_udp_dns_query(
     }
     let qtype = u16::from_be_bytes([packet[idx], packet[idx + 1]]);
 
-    if config.domain_rules.is_normalized_match(&qname) {
+    if config.matches_normalized(&qname) {
         let qend = idx + 4;
         let hijack_answer = dns_query_type_matches_listen_ip(qtype, listen_ip);
         // For matched-but-wrong-stack queries return NOERROR with empty answer
@@ -1070,7 +1101,7 @@ async fn handle_sni_connection(mut client: TcpStream, config: Arc<Config>) -> st
         }
     };
 
-    let matched = config.domain_rules.is_match(&target_domain);
+    let matched = config.matches_domain(&target_domain);
     let connect_fut = async {
         if matched {
             connect_target(
@@ -1114,7 +1145,7 @@ async fn handle_sni_connection(mut client: TcpStream, config: Arc<Config>) -> st
 async fn main() -> std::io::Result<()> {
     let config = Arc::new(parse_args().inspect_err(|_| print_usage())?);
 
-    let whitelist_state = match &config.whitelist {
+    let whitelist_state = match config.hot.load().whitelist.as_ref() {
         Some(wl) => format!("enabled ({} entries)", wl.len()),
         None => "disabled".to_string(),
     };
@@ -1161,6 +1192,8 @@ Bind to a specific routable IP per stack.",
         }
     }
 
+    spawn_reload_on_sighup(Arc::clone(&config))?;
+
     let socks5_sem = Arc::new(Semaphore::new(MAX_INFLIGHT_PROXY));
     match config.mode {
         Mode::Proxy => {
@@ -1177,6 +1210,46 @@ Bind to a specific routable IP per stack.",
     }
 
     tokio::signal::ctrl_c().await?;
+    Ok(())
+}
+
+// Re-read domain.conf + whitelist from disk and swap the HotConfig in place.
+// In-flight tasks keep their existing Arc<HotConfig> snapshot; new tasks pick
+// up the reloaded one. Returns an error without touching the live config if
+// either file fails to parse, so a broken edit can't blank the server out.
+fn reload_hot(config: &Config) -> std::io::Result<()> {
+    let domain_rules = match &config.domain_config_path {
+        Some(p) => DomainRules::load(p.clone())?,
+        None => DomainRules::default(),
+    };
+    let whitelist = match &config.whitelist_path {
+        Some(p) => Some(IpWhitelist::load(p.clone())?),
+        None => None,
+    };
+    let rule_count = domain_rules.exact.len()
+        + domain_rules.suffix.len()
+        + domain_rules.keyword.len()
+        + domain_rules.tld.len();
+    let wl_count = whitelist.as_ref().map_or(0, |wl| wl.len());
+    config.hot.store(Arc::new(HotConfig {
+        domain_rules,
+        whitelist,
+    }));
+    eprintln!("[reload] ok: {rule_count} domain rules, {wl_count} whitelist entries");
+    Ok(())
+}
+
+// Spawn a task that re-reads config files on every SIGHUP. A bad reload is
+// logged and skipped; the running config is unchanged.
+fn spawn_reload_on_sighup(config: Arc<Config>) -> std::io::Result<()> {
+    let mut hup = signal(SignalKind::hangup())?;
+    tokio::spawn(async move {
+        while hup.recv().await.is_some() {
+            if let Err(e) = reload_hot(&config) {
+                eprintln!("[reload] failed (keeping previous state): {e}");
+            }
+        }
+    });
     Ok(())
 }
 
