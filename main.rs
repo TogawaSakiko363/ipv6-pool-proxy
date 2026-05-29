@@ -28,6 +28,7 @@ const MAX_CLIENT_HELLO_LEN: usize = 16 * 1024 + 5;
 #[derive(Clone, Debug)]
 struct Config {
     listens: Vec<SocketAddr>,
+    socks5_listens: Vec<SocketAddr>,
     auth: Option<Auth>,
     prefix: Ipv6Prefix,
     mode: Mode,
@@ -331,6 +332,7 @@ fn invalid_input(message: &'static str) -> Error {
 
 fn parse_args() -> std::io::Result<Config> {
     let mut listen_strs: Vec<String> = Vec::new();
+    let mut socks5_listen_strs: Vec<String> = Vec::new();
     let mut auth = None;
     let mut prefix = None;
     let mut mode = Mode::Proxy;
@@ -346,6 +348,12 @@ fn parse_args() -> std::io::Result<Config> {
                     .next()
                     .ok_or_else(|| invalid_input("missing value for -l/--listen"))?;
                 listen_strs.push(value);
+            }
+            "-s" | "--socks5" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| invalid_input("missing value for -s/--socks5"))?;
+                socks5_listen_strs.push(value);
             }
             "-u" | "--user" => {
                 let value = args
@@ -421,14 +429,35 @@ fn parse_args() -> std::io::Result<Config> {
         }
         listens.push(addr);
     }
+
+    let mut socks5_listens: Vec<SocketAddr> = Vec::with_capacity(socks5_listen_strs.len());
+    for s in &socks5_listen_strs {
+        let addr: SocketAddr = s
+            .parse()
+            .map_err(|_| invalid_input("invalid SOCKS5 listen address, e.g. 0.0.0.0:1080"))?;
+        if socks5_listens.contains(&addr) {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                format!("duplicate -s/--socks5 address: {addr}"),
+            ));
+        }
+        socks5_listens.push(addr);
+    }
+
     let prefix = prefix.ok_or_else(|| invalid_input("missing required -p/--prefix IPv6 CIDR"))?;
     let domain_rules = if mode == Mode::Dns {
         let path = domain_config.unwrap_or_else(default_domain_config_path);
-        auth = None;
         DomainRules::load(path)?
     } else {
         DomainRules::default()
     };
+
+    // Auth only applies to SOCKS5 listeners. Strip it if there's nothing for
+    // it to gate (pure dns mode with no -s flags), so the startup banner
+    // doesn't claim auth is on when it never runs.
+    if mode == Mode::Dns && socks5_listens.is_empty() {
+        auth = None;
+    }
 
     let whitelist = match whitelist_path {
         Some(path) => Some(IpWhitelist::load(path)?),
@@ -437,6 +466,7 @@ fn parse_args() -> std::io::Result<Config> {
 
     Ok(Config {
         listens,
+        socks5_listens,
         auth,
         prefix,
         mode,
@@ -473,9 +503,10 @@ fn bind_tcp_listener(addr: SocketAddr) -> std::io::Result<TcpListener> {
 
 fn print_usage() {
     println!(
-        "Usage: ipv6-pool-proxy -m proxy|dns -l <addr:port> [-l <addr:port> ...] -u user:pass -p 2001:470:19:226::/64 [-c domain.conf] [-ipv4_pass_through true|false] [-w ip.conf]\n\n\
-Options:\n  -m, --mode <proxy|dns>              Run mode, default: proxy\n  -l, --listen <addr:port>            Listen address (repeat for dual-stack), default: 0.0.0.0:1080\n  -u, --user <user:pass>              Enable SOCKS5 username/password authentication; ignored in dns mode\n  -p, --prefix <ipv6/cidr>            Required outbound random IPv6 CIDR, e.g. 2001:470:19:226::/64\n  -c, --config <path>                 dns mode domain.conf path, default: domain.conf next to binary\n  -ipv4_pass_through <true|false>     Fallback to local default IPv4 outbound when target only has IPv4, default: false\n  -w, --whitelist <path>              Inbound IP whitelist file; if omitted, all IPs are allowed\n\n\
+        "Usage: ipv6-pool-proxy -m proxy|dns -l <addr:port> [-l <addr:port> ...] [-s <addr:port> ...] -u user:pass -p 2001:470:19:226::/64 [-c domain.conf] [-ipv4_pass_through true|false] [-w ip.conf]\n\n\
+Options:\n  -m, --mode <proxy|dns>              Run mode, default: proxy\n  -l, --listen <addr:port>            Listen address (repeat for dual-stack); in proxy mode this is SOCKS5; in dns mode this is DNS UDP + SNI TCP 443. Default: 0.0.0.0:1080\n  -s, --socks5 <addr:port>            Additional SOCKS5 listener (repeatable); can be combined with dns mode to run SOCKS5 + DNS simultaneously\n  -u, --user <user:pass>              Enable SOCKS5 username/password authentication (applies to both -l in proxy mode and -s anywhere)\n  -p, --prefix <ipv6/cidr>            Required outbound random IPv6 CIDR, e.g. 2001:470:19:226::/64\n  -c, --config <path>                 dns mode domain.conf path, default: domain.conf next to binary\n  -ipv4_pass_through <true|false>     Fallback to local default IPv4 outbound when target only has IPv4, default: false\n  -w, --whitelist <path>              Inbound IP whitelist file; if omitted, all IPs are allowed\n\n\
 Dual-stack listen example:\n  ipv6-pool-proxy -m dns -l 1.2.3.4:53 -l [2001:db8::1]:53 -p 2001:db8:abcd::/48 -c domain.conf\n  (A query hits the v4 socket and gets A; AAAA hits the v6 socket and gets AAAA; cross-stack queries return empty NOERROR (NODATA))\n\n\
+SOCKS5 + DNS together:\n  ipv6-pool-proxy -m dns -l 1.2.3.4:53 -s 0.0.0.0:1080 -u alice:secret -p 2001:db8:abcd::/48 -c domain.conf\n  (DNS+SNI on :53/:443 plus a SOCKS5 listener on :1080 with password auth, all sharing the same IPv6 outbound pool)\n\n\
 domain.conf examples:\n  google.com                 Hijack exact domain only\n  suffix:google.com          Hijack domain and all subdomains\n  keyword:google             Hijack domains containing keyword\n  tld:com                    Hijack all domains with this suffix\n\n\
 ip.conf examples:\n  1.1.1.1                    Single IPv4\n  1.1.1.0/24                 IPv4 CIDR\n  ::1                        Single IPv6\n  2001:db8::/32              IPv6 CIDR\n  # comments after '#' are ignored"
     );
@@ -532,18 +563,6 @@ async fn connect_direct(target: TargetAddr) -> std::io::Result<TcpStream> {
     Ok(stream)
 }
 
-async fn connect_by_mode(target: TargetAddr, config: &Config) -> std::io::Result<TcpStream> {
-    match config.mode {
-        Mode::Proxy => connect_target(target, config.prefix, config.ipv4_pass_through).await,
-        Mode::Dns => match &target {
-            TargetAddr::Domain(domain, _) if config.domain_rules.is_match(domain) => {
-                connect_target(target, config.prefix, config.ipv4_pass_through).await
-            }
-            _ => connect_direct(target).await,
-        },
-    }
-}
-
 async fn handle_client(mut client: TcpStream, config: Arc<Config>) -> std::io::Result<()> {
     // Bound the entire SOCKS5 negotiation to a single timeout so slow / dead
     // peers cannot park a socket indefinitely.
@@ -554,7 +573,11 @@ async fn handle_client(mut client: TcpStream, config: Arc<Config>) -> std::io::R
     .await
     .map_err(|_| Error::new(ErrorKind::TimedOut, "socks5 handshake timeout"))??;
 
-    match timeout(CONNECT_TIMEOUT, connect_by_mode(target, &config)).await {
+    // SOCKS5 is an explicit proxy: every connection routes through the
+    // random IPv6 pool, regardless of dns-mode domain rules (those only
+    // gate the SNI proxy's hijack path).
+    let connect_fut = connect_target(target, config.prefix, config.ipv4_pass_through);
+    match timeout(CONNECT_TIMEOUT, connect_fut).await {
         Ok(Ok(mut remote)) => {
             send_socks5_reply(&mut client, 0x00).await?;
             let _ = copy_bidirectional_with_sizes(
@@ -1102,10 +1125,21 @@ async fn main() -> std::io::Result<()> {
         .map(|a| a.to_string())
         .collect::<Vec<_>>()
         .join(", ");
+    let socks5_str = if config.socks5_listens.is_empty() {
+        "none".to_string()
+    } else {
+        config
+            .socks5_listens
+            .iter()
+            .map(|a| a.to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
 
     println!(
-        "IPv6 pool proxy starting on [{}], mode: {:?}, auth: {}, prefix: {}/{}, ipv4_pass_through: {}, whitelist: {}",
+        "IPv6 pool proxy starting on [{}], socks5: [{}], mode: {:?}, auth: {}, prefix: {}/{}, ipv4_pass_through: {}, whitelist: {}",
         listens_str,
+        socks5_str,
         config.mode,
         if config.auth.is_some() { "enabled" } else { "disabled" },
         Ipv6Addr::from(config.prefix.network),
@@ -1127,27 +1161,41 @@ Bind to a specific routable IP per stack.",
         }
     }
 
+    let socks5_sem = Arc::new(Semaphore::new(MAX_INFLIGHT_PROXY));
     match config.mode {
         Mode::Proxy => {
-            let sem = Arc::new(Semaphore::new(MAX_INFLIGHT_PROXY));
-            for listen in &config.listens {
-                let listener = bind_tcp_listener(*listen)?;
-                let sem = Arc::clone(&sem);
-                let cfg = Arc::clone(&config);
-                tokio::spawn(async move {
-                    run_accept_loop(listener, sem, cfg, |client, cfg| async move {
-                        handle_client(client, cfg).await
-                    })
-                    .await;
-                });
-            }
-            tokio::signal::ctrl_c().await?;
-            Ok(())
+            spawn_socks5_listeners(&config.listens, Arc::clone(&config), Arc::clone(&socks5_sem))?;
         }
         Mode::Dns => {
             start_dns_services(Arc::clone(&config)).await?;
-            tokio::signal::ctrl_c().await?;
-            Ok(())
         }
     }
+
+    // --socks5 flag spawns additional SOCKS5 listeners in either mode.
+    if !config.socks5_listens.is_empty() {
+        spawn_socks5_listeners(&config.socks5_listens, Arc::clone(&config), socks5_sem)?;
+    }
+
+    tokio::signal::ctrl_c().await?;
+    Ok(())
+}
+
+fn spawn_socks5_listeners(
+    listens: &[SocketAddr],
+    config: Arc<Config>,
+    sem: Arc<Semaphore>,
+) -> std::io::Result<()> {
+    for listen in listens {
+        let listener = bind_tcp_listener(*listen)?;
+        println!("SOCKS5 listening on {listen}");
+        let sem = Arc::clone(&sem);
+        let cfg = Arc::clone(&config);
+        tokio::spawn(async move {
+            run_accept_loop(listener, sem, cfg, |client, cfg| async move {
+                handle_client(client, cfg).await
+            })
+            .await;
+        });
+    }
+    Ok(())
 }
