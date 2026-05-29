@@ -12,3 +12,12 @@ tokio = { version = "1", features = ["full"] }
 rand = "0.8"
 socket2 = { version = "0.5", features = ["all"] }
 arc-swap = "1"
+tokio = { version = "1.52.3", features = ["full"] }
+rand = "0.10.1"
+socket2 = { version = "0.6.3", features = ["all"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
