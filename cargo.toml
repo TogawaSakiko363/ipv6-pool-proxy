@@ -11,3 +11,4 @@ path = "main.rs"
 tokio = { version = "1", features = ["full"] }
 rand = "0.8"
 socket2 = { version = "0.5", features = ["all"] }
+arc-swap = "1"
