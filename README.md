@@ -1,17 +1,18 @@
 # ipv6-pool-proxy
 
-`ipv6-pool-proxy` 是一个基于 Rust/Tokio 的 IPv6 随机子网出站工具，支持两种模式：
+`ipv6-pool-proxy` 是一个基于 Rust/Tokio 的 IPv6 随机子网出站工具，可同时提供两种服务：
 
-- `proxy`：提供传统 SOCKS5 代理服务，客户端通过 SOCKS5 接入。
-- `dns`：提供 DNS 劫持解析服务，并在本机 TCP 443 提供 SNI Proxy，将被劫持域名的 HTTPS 流量通过随机 IPv6 地址出站。
+- **SOCKS5 代理**：通过 `-proxy` 指定监听地址，提供 SOCKS5 CONNECT 代理。
+- **DNS 劫持 + SNI Proxy**：通过 `-dns` 指定监听地址，提供 UDP DNS 劫持解析 + TCP 443 SNI Proxy，将被劫持域名的 HTTPS 流量通过随机 IPv6 地址出站。
+
+两种服务可以独立启动，也可以同时运行，共享同一个 IPv6 出站前缀。
 
 ## 功能特性
 
-- SOCKS5 CONNECT 代理（`proxy` 模式）。
-- 可选 SOCKS5 用户名/密码认证（仅 `proxy` 模式有效）。
+- SOCKS5 CONNECT 代理（`-proxy` 监听地址）。
+- DNS 劫持 + SNI Proxy（`-dns` 监听地址，UDP DNS + TCP 443）。
+- 可选 SOCKS5 用户名/密码认证（仅代理端口有效）。
 - 使用指定 IPv6 CIDR 前缀随机生成本地出站 IPv6 地址。
-- `dns` 模式通过 UDP DNS 服务返回劫持 IP。
-- `dns` 模式内置 TCP 443 SNI Proxy，根据 TLS ClientHello 中的 SNI 识别目标域名并转发。
 - 支持 `domain.conf` 精确域名、后缀、关键词、TLD 规则。
 - 支持 `-ipv4_pass_through true|false`：目标只有 IPv4 时是否回落到本机默认 IPv4 出站。
 - 支持 `-w ip.conf` 入站 IP 白名单，作用于 SOCKS5、SNI Proxy 与 DNS UDP 三个入口；支持单 IP 与 CIDR、IPv4 与 IPv6 混写。
@@ -105,79 +106,88 @@ target/release/ipv6-pool-proxy
 ## 命令行参数
 
 ```text
-Usage: ipv6-pool-proxy -m proxy|dns -l <addr:port> [-l <addr:port> ...] -u user:pass -p 2001:470:19:226::/64 [-c domain.conf] [-ipv4_pass_through true|false] [-w ip.conf]
+Usage: ipv6-pool-proxy [-dns <addr:port> ...] [-proxy <addr:port> ...] [options]
 ```
 
 参数说明：
 
 | 参数 | 默认值 | 说明 |
 | --- | --- | --- |
-| `-m`, `--mode` | `proxy` | 运行模式，可选 `proxy` 或 `dns`。 |
-| `-l`, `--listen` | `0.0.0.0:1080` | 监听地址，可重复多次指定多个地址（见下方双栈说明）。`proxy` 模式为 SOCKS5 TCP 监听地址；`dns` 模式为 UDP DNS 监听地址。 |
-| `-u`, `--user` | 无 | SOCKS5 用户名密码认证，格式为 `user:pass`。在 `dns` 模式下会被忽略。 |
+| `-dns`, `--dns` | 无 | DNS UDP + SNI TCP 443 监听地址，可重复指定多个（见下方双栈说明）。 |
+| `-proxy`, `--proxy` | `0.0.0.0:1080`（当两个都未指定时） | SOCKS5 代理监听地址，可重复指定多个。 |
+| `-u`, `--user` | 无 | SOCKS5 用户名密码认证，格式为 `user:pass`。仅在配置了 `-proxy` 时生效。 |
 | `-p`, `--prefix` | 必填 | 出站随机 IPv6 CIDR，例如 `2001:470:19:226::/64`。 |
-| `-c`, `--config` | 二进制同目录下的 `domain.conf` | `dns` 模式域名规则文件路径。 |
+| `-c`, `--config` | 二进制同目录下的 `domain.conf` | DNS 域名规则文件路径。当配置了 `-dns` 时自动启用。 |
 | `-ipv4_pass_through`, `--ipv4_pass_through` | `false` | 当目标只有 IPv4 时，是否回落到本机默认 IPv4 出站。 |
 | `-w`, `--whitelist` | 无 | 入站 IP 白名单文件路径。未传时不启用白名单（允许所有 IP 连入）；传了则只放行命中的来源 IP。 |
 | `-h`, `--help` | 无 | 显示帮助信息。 |
 
 ### 多监听地址与双栈
 
-`-l` 可重复指定，每个地址启动一个独立监听器（`proxy` 模式）或一对 DNS+SNI 服务（`dns` 模式）。重复指定相同地址会启动失败。
+`-dns` 和 `-proxy` 均可重复指定，每个地址启动一个独立监听器。重复指定相同地址会启动失败。
+
+- 每个 `-dns` 地址启动一对服务：UDP DNS + TCP 443 SNI Proxy
+- 每个 `-proxy` 地址启动一个 SOCKS5 TCP 监听器
 
 双栈场景下推荐分别绑定 IPv4 和 IPv6 地址，而非使用 `[::]` 通配：
 
 ```bash
-# proxy 模式双栈
-./ipv6-pool-proxy -m proxy -l 0.0.0.0:1080 -l [::]:1080 -p 2001:db8:1234:5678::/64
+# SOCKS5 代理双栈
+./ipv6-pool-proxy -proxy 0.0.0.0:1080 -proxy [::]:1080 -p 2001:db8:1234:5678::/64
 
-# dns 模式双栈（推荐绑定具体 IP 而非通配，见下方注意事项）
-./ipv6-pool-proxy -m dns -l 1.2.3.4:53 -l [2001:db8::1]:53 -p 2001:db8:1234:5678::/64 -c domain.conf
+# DNS 双栈（推荐绑定具体 IP 而非通配，见下方注意事项）
+./ipv6-pool-proxy -dns 1.2.3.4:53 -dns [2001:db8::1]:53 -p 2001:db8:1234:5678::/64 -c domain.conf
 ```
 
-`dns` 模式下，每个监听地址的 IP 就是该 socket 劫持 DNS 查询时返回的答案地址：IPv4 socket 返回 A 记录，IPv6 socket 返回 AAAA 记录，类型不匹配时返回 NOERROR 空答案（NODATA）而非 NXDOMAIN，避免双栈客户端因某一族返回 NXDOMAIN 而放弃另一族的查询。
+DNS 模式下，每个监听地址的 IP 就是该 socket 劫持 DNS 查询时返回的答案地址：IPv4 socket 返回 A 记录，IPv6 socket 返回 AAAA 记录，类型不匹配时返回 NOERROR 空答案（NODATA）而非 NXDOMAIN，避免双栈客户端因某一族返回 NXDOMAIN 而放弃另一族的查询。
 
-> **注意**：`dns` 模式下若 `-l` 使用通配地址（`0.0.0.0` 或 `::`），DNS 劫持答案也会返回通配地址，客户端无法连接，启动时程序会打印警告。请绑定具体的可路由 IP。
+> **注意**：若 `-dns` 使用通配地址（`0.0.0.0` 或 `::`），DNS 劫持答案也会返回通配地址，客户端无法连接，启动时程序会打印警告。请绑定具体的可路由 IP。
 
-## proxy 模式
+## SOCKS5 代理模式
 
-`proxy` 模式下，程序提供 SOCKS5 服务。客户端通过 SOCKS5 CONNECT 访问目标，目标会优先解析 IPv6，并通过指定 IPv6 子网中的随机地址出站。
+`-proxy` 指定 SOCKS5 代理监听地址。客户端通过 SOCKS5 CONNECT 访问目标，目标会优先解析 IPv6，并通过指定 IPv6 子网中的随机地址出站。
 
 无认证示例：
 
 ```bash
-./ipv6-pool-proxy -m proxy -l 0.0.0.0:1080 -p 2001:db8:1234:5678::/64
+./ipv6-pool-proxy -proxy 0.0.0.0:1080 -p 2001:db8:1234:5678::/64
+```
+
+不传 `-proxy` 时默认启动 `0.0.0.0:1080` 的 SOCKS5 代理：
+
+```bash
+./ipv6-pool-proxy -p 2001:db8:1234:5678::/64
 ```
 
 开启用户名密码认证：
 
 ```bash
-./ipv6-pool-proxy -m proxy -l 0.0.0.0:1080 -u user:pass -p 2001:db8:1234:5678::/64
+./ipv6-pool-proxy -proxy 0.0.0.0:1080 -u user:pass -p 2001:db8:1234:5678::/64
 ```
 
 如果目标域名只有 IPv4，默认会返回失败。开启 IPv4 回落：
 
 ```bash
-./ipv6-pool-proxy -m proxy -l 0.0.0.0:1080 -p 2001:db8:1234:5678::/64 -ipv4_pass_through true
+./ipv6-pool-proxy -proxy 0.0.0.0:1080 -p 2001:db8:1234:5678::/64 -ipv4_pass_through true
 ```
 
 双栈监听（IPv4 和 IPv6 客户端各走独立 socket）：
 
 ```bash
-./ipv6-pool-proxy -m proxy -l 0.0.0.0:1080 -l [::]:1080 -p 2001:db8:1234:5678::/64
+./ipv6-pool-proxy -proxy 0.0.0.0:1080 -proxy [::]:1080 -p 2001:db8:1234:5678::/64
 ```
 
-## dns 模式
+## DNS 劫持 + SNI Proxy 模式
 
-`dns` 模式不是 SOCKS5 模式。它会为每个 `-l` 地址启动一对服务：
+`-dns` 为每个地址启动一对服务：
 
-1. UDP DNS 服务：监听 `-l` 指定的地址和端口。
-2. TCP 443 SNI Proxy：监听 `-l` 指定 IP 的 TCP 443 端口。
+1. **UDP DNS 服务**：监听指定地址和端口。
+2. **TCP 443 SNI Proxy**：监听指定 IP 的 TCP 443 端口（端口号固定为 443）。
 
 单栈示例：
 
 ```bash
-./ipv6-pool-proxy -m dns -l 1.2.3.4:53 -p 2001:db8:1234:5678::/64 -c /etc/ipv6-pool-proxy/domain.conf
+./ipv6-pool-proxy -dns 1.2.3.4:53 -p 2001:db8:1234:5678::/64 -c /etc/ipv6-pool-proxy/domain.conf
 ```
 
 此时：
@@ -192,9 +202,8 @@ Usage: ipv6-pool-proxy -m proxy|dns -l <addr:port> [-l <addr:port> ...] -u user:
 双栈示例（A 查询走 IPv4 socket 返回 A 记录，AAAA 查询走 IPv6 socket 返回 AAAA 记录）：
 
 ```bash
-./ipv6-pool-proxy -m dns \
-  -l 1.2.3.4:53 \
-  -l [2001:db8::1]:53 \
+./ipv6-pool-proxy -dns 1.2.3.4:53 \
+  -dns [2001:db8::1]:53 \
   -p 2001:db8:1234:5678::/64 \
   -c /etc/ipv6-pool-proxy/domain.conf
 ```
@@ -202,15 +211,30 @@ Usage: ipv6-pool-proxy -m proxy|dns -l <addr:port> [-l <addr:port> ...] -u user:
 开启 IPv4 回落：
 
 ```bash
-./ipv6-pool-proxy -m dns -l 1.2.3.4:53 -p 2001:db8:1234:5678::/64 -c /etc/ipv6-pool-proxy/domain.conf -ipv4_pass_through true
+./ipv6-pool-proxy -dns 1.2.3.4:53 -p 2001:db8:1234:5678::/64 -c /etc/ipv6-pool-proxy/domain.conf -ipv4_pass_through true
 ```
+
+## DNS + SOCKS5 同时运行
+
+两个服务可以同时启动，共享同一个 IPv6 出站前缀：
+
+```bash
+./ipv6-pool-proxy -dns 1.2.3.4:53 -proxy 0.0.0.0:11001 -u alice:secret -p 2001:db8:1234:5678::/64 -c domain.conf
+```
+
+此时：
+
+- DNS + SNI 监听 `1.2.3.4:53/udp` 和 `1.2.3.4:443/tcp`
+- SOCKS5 代理监听 `0.0.0.0:11001/tcp`（带密码认证）
+- 两者使用相同的 IPv6 前缀随机出站
+
+这个模式完全替代了旧版 `-m dns -l 1.2.3.4:53 -s 0.0.0.0:11001` 的用法。
 
 注意：
 
-- `dns` 模式下 `-u` / `--user` 会被忽略。
-- `dns` 模式目前劫持 HTTPS/SNI 流量，即 TCP 443。
-- `dns` 模式依赖客户端使用本程序提供的 DNS 解析结果访问目标。
-- **`-l` 必须绑定具体可路由 IP**，不能用 `0.0.0.0` / `::` 等通配地址，否则 DNS 劫持答案会返回不可连接的地址，启动时程序会打印 `[warn]` 警告。
+- `-u` / `--user` 仅在配置了 `-proxy` 时生效，纯 DNS 模式下会被忽略。
+- DNS 模式依赖客户端使用本程序提供的 DNS 解析结果访问目标。
+- **`-dns` 必须绑定具体可路由 IP**，不能用 `0.0.0.0` / `::` 等通配地址，否则 DNS 劫持答案会返回不可连接的地址，启动时程序会打印 `[warn]` 警告。
 - 如果监听标准端口 53/443，通常需要 root 权限或为二进制授予绑定低端口能力。
 
 授予低端口绑定能力示例：
@@ -252,9 +276,9 @@ tld:com
 
 通过 `-w ip.conf` 启用入站白名单。启用后，**只有命中白名单的来源 IP** 才能与本程序建立连接，作用范围覆盖：
 
-- `proxy` 模式的 SOCKS5 TCP 端口；
-- `dns` 模式的 SNI Proxy TCP 443 端口；
-- `dns` 模式的 UDP DNS 端口。
+- SOCKS5 代理 TCP 端口；
+- SNI Proxy TCP 443 端口；
+- UDP DNS 端口。
 
 未命中的来源连接会被立即关闭（TCP RST）或丢弃（UDP），程序不返回任何应用层应答。TCP 白名单拒绝和过载丢连接均会在 stderr 打印一行日志（`[whitelist deny tcp]` / `[overload]`）。
 
@@ -281,7 +305,7 @@ tld:com
 启动示例：
 
 ```bash
-./ipv6-pool-proxy -m proxy -l 0.0.0.0:1080 -p 2001:db8:1234:5678::/64 -w /etc/ipv6-pool-proxy/ip.conf
+./ipv6-pool-proxy -proxy 0.0.0.0:1080 -p 2001:db8:1234:5678::/64 -w /etc/ipv6-pool-proxy/ip.conf
 ```
 
 启动日志会显示载入条目数，便于发现配置错误：
@@ -295,7 +319,7 @@ tld:com
 - **不传 `-w`** 等价于不启用白名单，所有来源 IP 均放行（保持旧行为）。
 - **传了 `-w` 但文件为空** 会启用白名单且 0 条目，此时**任何来源都会被拒绝**，程序不会自动放行 `127.0.0.1` 之类，需要显式写入白名单。
 - **`-w` 指定的文件不存在** 会启动失败，避免误以为生效。
-- 当 `-l` 监听地址是 `[::]` 这类双栈地址时，IPv4 客户端在内核层会以 `::ffff:1.2.3.4` 形式被 accept；程序内部已自动归一化为 `1.2.3.4`，因此白名单中**直接写 IPv4 地址即可**，无需写 v4-mapped IPv6 形式。
+- 当监听地址是 `[::]` 这类双栈地址时，IPv4 客户端在内核层会以 `::ffff:1.2.3.4` 形式被 accept；程序内部已自动归一化为 `1.2.3.4`，因此白名单中**直接写 IPv4 地址即可**，无需写 v4-mapped IPv6 形式。
 - 白名单只控制"谁能连入"，不影响出站随机 IPv6 行为。
 
 ## systemd 示例
@@ -313,9 +337,8 @@ Wants=network-online.target
 [Service]
 Type=simple
 ExecStart=/usr/local/bin/ipv6-pool-proxy \
-  -m dns \
-  -l 1.2.3.4:53 \
-  -l [2001:db8::1]:53 \
+  -dns 1.2.3.4:53 \
+  -dns [2001:db8::1]:53 \
   -p 2001:db8:1234:5678::/64 \
   -c /etc/ipv6-pool-proxy/domain.conf \
   -ipv4_pass_through true \
@@ -366,20 +389,20 @@ ip -6 neigh
 
 如果不是隧道 IPv6 子网，请检查 `ndppd` 是否安装、运行，并确认 `/etc/ndppd.conf` 中的网卡名和 IPv6 前缀正确。
 
-### dns 模式启动失败
+### DNS 模式启动失败
 
-`dns` 模式需要读取 `domain.conf`。如果没有通过 `-c` 指定，程序会从二进制文件同目录读取 `domain.conf`。请确认文件存在且规则格式正确。
+DNS 模式需要读取 `domain.conf`。如果没有通过 `-c` 指定，程序会从二进制文件同目录读取 `domain.conf`。请确认文件存在且规则格式正确。
 
 如果监听 `:53` 或 TCP `443` 启动失败，请检查是否具备低端口绑定权限，以及端口是否已被其它服务占用。
 
-如果启动时看到 `[warn] dns mode: listener ... uses a wildcard IP`，说明 `-l` 使用了 `0.0.0.0` 或 `::` 通配地址，DNS 劫持答案将返回不可连接的地址。请改为绑定具体的可路由 IP，例如 `-l 1.2.3.4:53`。
+如果启动时看到 `[warn] dns listener ... is a wildcard IP`，说明 `-dns` 使用了 `0.0.0.0` 或 `::` 通配地址，DNS 劫持答案将返回不可连接的地址。请改为绑定具体的可路由 IP，例如 `-dns 1.2.3.4:53`。
 
 ### DNS 命中但 HTTPS 无法访问
 
 检查：
 
 - 客户端 DNS 是否确实指向本程序。
-- DNS 返回的 IP 是否为本程序 `-l` 指定的监听 IP。
+- DNS 返回的 IP 是否为本程序 `-dns` 指定的监听 IP。
 - 本程序 TCP 443 是否可达。
 - 目标是否使用 TLS SNI；没有 SNI 的 TLS 连接无法识别真实域名。
 
