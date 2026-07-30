@@ -8,16 +8,31 @@ name = "ipv6-pool-proxy"
 path = "main.rs"
 
 [dependencies]
-tokio = { version = "1", features = ["full"] }
-rand = "0.8"
-socket2 = { version = "0.5", features = ["all"] }
-arc-swap = "1"
-tokio = { version = "1.52.3", features = ["full"] }
+tokio = { version = "1.52.3", features = [
+    "rt-multi-thread",
+    "net",
+    "io-util",
+    "time",
+    "signal",
+    "sync",
+    "macros",
+] }
 rand = "0.10.1"
 socket2 = { version = "0.6.3", features = ["all"] }
+arc-swap = "1"
+libc = "0.2"
+
+# Faster multithreaded allocator. musl's default malloc serializes badly under
+# high concurrency; mimalloc removes that bottleneck (big win on ARM/musl).
+[target.'cfg(target_os = "linux")'.dependencies]
+mimalloc = { version = "0.1", default-features = false }
 
 [profile.release]
 opt-level = 3
 lto = true
 codegen-units = 1
 strip = true
+# NOTE: intentionally NOT panic = "abort". With the default unwind, a panic in
+# one connection task (e.g. a malformed packet slipping past a bounds check) is
+# isolated by tokio and only kills that task — the server keeps serving. abort
+# would take the whole process down on any single panic.
