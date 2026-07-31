@@ -1,5 +1,4 @@
 use arc_swap::ArcSwap;
-use rand::Rng;
 use std::env;
 use std::fs;
 use std::io::{Error, ErrorKind};
@@ -7,11 +6,17 @@ use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{copy_bidirectional_with_sizes, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{lookup_host, TcpListener, TcpSocket, TcpStream, UdpSocket};
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::Semaphore;
 use tokio::time::timeout;
+
+// musl's default allocator serializes hard under many concurrent threads;
+// mimalloc removes that bottleneck. Biggest single win on this ARM/musl build.
+#[cfg(target_os = "linux")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 // --- High-concurrency tunables ---
 // Keep per-connection footprint small and apply timeouts everywhere so a slow
@@ -20,10 +25,14 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const SNI_READ_TIMEOUT: Duration = Duration::from_secs(15);
 const UPSTREAM_DNS_TIMEOUT: Duration = Duration::from_secs(5);
-const COPY_BUF_SIZE: usize = 4 * 1024;          // per direction; ~8 KB/conn
-const MAX_INFLIGHT_PROXY: usize = 300_000;      // hard cap on in-flight TCP handlers
-const MAX_INFLIGHT_SNI: usize = 300_000;
-const MAX_INFLIGHT_DNS: usize = 50_000;         // hard cap on in-flight UDP DNS workers
+const COPY_BUF_SIZE: usize = 16 * 1024;         // fallback path only (non-Linux)
+// Concurrency caps are the primary OOM guard: every accepted connection costs
+// fds + buffers (splice adds a kernel pipe per direction), so an unbounded
+// accept storm on a small box means the kernel OOM-kills us. These are
+// defaults; override with --max-conns / --max-dns to fit the host's RAM.
+// 32k conns * ~2 splice pipes stays well under a few GB.
+const DEFAULT_MAX_CONNS: usize = 32_768;        // in-flight TCP handlers (SOCKS5 + SNI)
+const DEFAULT_MAX_DNS: usize = 16_384;          // in-flight UDP DNS workers
 const ACCEPT_BACKOFF_MAX_MS: u64 = 1000;
 // TLS record payload max is 16384; ClientHello sits in one record.
 const MAX_CLIENT_HELLO_LEN: usize = 16 * 1024 + 5;
@@ -39,6 +48,9 @@ struct Config {
     // domain rules only apply to dns mode and whitelist is opt-in.
     domain_config_path: Option<PathBuf>,
     whitelist_path: Option<PathBuf>,
+    // Admission-control caps; sized to host RAM to bound worst-case memory.
+    max_conns: usize,
+    max_dns: usize,
     // File-backed state that can change at runtime via SIGHUP. Hot-path code
     // does config.hot.load() once per task; reload is lock-free via ArcSwap.
     hot: ArcSwap<HotConfig>,
@@ -345,6 +357,8 @@ fn parse_args() -> std::io::Result<Config> {
     let mut domain_config: Option<PathBuf> = None;
     let mut ipv4_pass_through = false;
     let mut whitelist_path: Option<PathBuf> = None;
+    let mut max_conns = DEFAULT_MAX_CONNS;
+    let mut max_dns = DEFAULT_MAX_DNS;
 
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -399,6 +413,26 @@ fn parse_args() -> std::io::Result<Config> {
                     .next()
                     .ok_or_else(|| invalid_input("missing value for -w/--whitelist"))?;
                 whitelist_path = Some(PathBuf::from(value));
+            }
+            "--max-conns" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| invalid_input("missing value for --max-conns"))?;
+                max_conns = value
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|n| *n > 0)
+                    .ok_or_else(|| invalid_input("--max-conns must be a positive integer"))?;
+            }
+            "--max-dns" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| invalid_input("missing value for --max-dns"))?;
+                max_dns = value
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|n| *n > 0)
+                    .ok_or_else(|| invalid_input("--max-dns must be a positive integer"))?;
             }
             "-h" | "--help" => {
                 print_usage();
@@ -475,6 +509,8 @@ fn parse_args() -> std::io::Result<Config> {
         ipv4_pass_through,
         domain_config_path,
         whitelist_path,
+        max_conns,
+        max_dns,
         hot: ArcSwap::from_pointee(HotConfig {
             domain_rules,
             whitelist,
@@ -587,13 +623,7 @@ async fn handle_client(mut client: TcpStream, config: Arc<Config>) -> std::io::R
     match timeout(CONNECT_TIMEOUT, connect_fut).await {
         Ok(Ok(mut remote)) => {
             send_socks5_reply(&mut client, 0x00).await?;
-            let _ = copy_bidirectional_with_sizes(
-                &mut client,
-                &mut remote,
-                COPY_BUF_SIZE,
-                COPY_BUF_SIZE,
-            )
-            .await;
+            let _ = relay_bidirectional(&mut client, &mut remote).await;
             Ok(())
         }
         Ok(Err(err)) => {
@@ -798,8 +828,8 @@ async fn run_accept_loop<F, Fut>(
 // IP is what we put in the DNS hijack answer, so an IPv4 client hitting the v4
 // socket gets an A record, an IPv6 client hitting the v6 socket gets AAAA.
 async fn start_dns_services(config: Arc<Config>) -> std::io::Result<()> {
-    let dns_sem = Arc::new(Semaphore::new(MAX_INFLIGHT_DNS));
-    let sni_sem = Arc::new(Semaphore::new(MAX_INFLIGHT_SNI));
+    let dns_sem = Arc::new(Semaphore::new(config.max_dns));
+    let sni_sem = Arc::new(Semaphore::new(config.max_conns));
 
     for listen in &config.dns_listens {
         let udp = Arc::new(UdpSocket::bind(*listen).await?);
@@ -1107,14 +1137,131 @@ async fn handle_sni_connection(mut client: TcpStream, config: Arc<Config>) -> st
         eprintln!("[sni forward] {peer} -> {target_domain}: {e}");
         return Err(e);
     }
-    let _ = copy_bidirectional_with_sizes(
-        &mut client,
-        &mut remote_stream,
-        COPY_BUF_SIZE,
-        COPY_BUF_SIZE,
-    )
-    .await;
+    let _ = relay_bidirectional(&mut client, &mut remote_stream).await;
     Ok(())
+}
+
+// --- Zero-copy bidirectional relay ---
+// On Linux, shuttle bytes socket<->socket entirely in the kernel via splice()
+// through a per-direction pipe: no userspace copy, lower CPU and memory
+// bandwidth (matters most on the 2-core ARM box). Everywhere else, fall back to
+// tokio's userspace copy.
+#[cfg(target_os = "linux")]
+async fn relay_bidirectional(a: &mut TcpStream, b: &mut TcpStream) -> std::io::Result<()> {
+    splice_relay::bidirectional(a, b).await
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn relay_bidirectional(a: &mut TcpStream, b: &mut TcpStream) -> std::io::Result<()> {
+    tokio::io::copy_bidirectional_with_sizes(a, b, COPY_BUF_SIZE, COPY_BUF_SIZE)
+        .await
+        .map(|_| ())
+}
+
+#[cfg(target_os = "linux")]
+mod splice_relay {
+    use std::io::{Error, ErrorKind, Result};
+    use std::os::unix::io::{AsRawFd, RawFd};
+    use tokio::io::Interest;
+    use tokio::net::TcpStream;
+
+    // Move up to 64 KiB per splice call. Kept at the default pipe capacity so we
+    // never enlarge kernel pipe buffers — under a connection flood, oversized
+    // pipes would multiply memory per connection and defeat the OOM guard.
+    const CHUNK: usize = 64 * 1024;
+    const FLAGS: libc::c_uint = (libc::SPLICE_F_MOVE | libc::SPLICE_F_NONBLOCK) as libc::c_uint;
+
+    struct Pipe {
+        r: RawFd,
+        w: RawFd,
+    }
+
+    impl Pipe {
+        fn new() -> Result<Self> {
+            let mut fds = [0 as libc::c_int; 2];
+            // O_NONBLOCK keeps splice from ever blocking the runtime thread;
+            // O_CLOEXEC avoids leaking the pipe into any child process.
+            let rc = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_NONBLOCK | libc::O_CLOEXEC) };
+            if rc != 0 {
+                return Err(Error::last_os_error());
+            }
+            Ok(Pipe { r: fds[0], w: fds[1] })
+        }
+    }
+
+    impl Drop for Pipe {
+        fn drop(&mut self) {
+            unsafe {
+                libc::close(self.r);
+                libc::close(self.w);
+            }
+        }
+    }
+
+    fn splice(fd_in: RawFd, fd_out: RawFd, len: usize) -> Result<usize> {
+        let n = unsafe {
+            libc::splice(
+                fd_in,
+                std::ptr::null_mut(),
+                fd_out,
+                std::ptr::null_mut(),
+                len,
+                FLAGS,
+            )
+        };
+        if n < 0 {
+            Err(Error::last_os_error())
+        } else {
+            Ok(n as usize)
+        }
+    }
+
+    // Pump one direction (src -> dst) until src reaches EOF or a fatal error.
+    // On clean EOF, half-close dst's write side so the peer observes FIN while
+    // the other direction can keep flowing.
+    async fn pump(src: &TcpStream, dst: &TcpStream) -> Result<()> {
+        let pipe = Pipe::new()?;
+        let src_fd = src.as_raw_fd();
+        let dst_fd = dst.as_raw_fd();
+
+        loop {
+            // socket -> pipe (wait for readable, retry on EAGAIN)
+            let n = loop {
+                match src.try_io(Interest::READABLE, || splice(src_fd, pipe.w, CHUNK)) {
+                    Ok(n) => break n,
+                    Err(e) if e.kind() == ErrorKind::WouldBlock => src.readable().await?,
+                    Err(e) => return Err(e),
+                }
+            };
+            if n == 0 {
+                break; // EOF
+            }
+
+            // pipe -> socket; fully drain so the pipe is empty before the next
+            // read (guarantees the next splice-in can't hit a full pipe).
+            let mut remaining = n;
+            while remaining > 0 {
+                match dst.try_io(Interest::WRITABLE, || splice(pipe.r, dst_fd, remaining)) {
+                    Ok(0) => return Err(Error::new(ErrorKind::WriteZero, "splice wrote zero")),
+                    Ok(m) => remaining -= m,
+                    Err(e) if e.kind() == ErrorKind::WouldBlock => dst.writable().await?,
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+
+        let _ = unsafe { libc::shutdown(dst_fd, libc::SHUT_WR) };
+        Ok(())
+    }
+
+    pub async fn bidirectional(a: &mut TcpStream, b: &mut TcpStream) -> Result<()> {
+        let (a, b) = (&*a, &*b);
+        let (r1, r2) = tokio::join!(pump(a, b), pump(b, a));
+        // Either direction erroring means the relay ended abnormally; report the
+        // first error but always let both halves finish first (join! already
+        // awaits both).
+        r1.and(r2)
+    }
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -1148,14 +1295,16 @@ async fn main() -> std::io::Result<()> {
     };
 
     println!(
-        "IPv6 pool proxy starting on dns: [{}], proxy: [{}], auth: {}, prefix: {}/{}, ipv4_pass_through: {}, whitelist: {}",
+        "IPv6 pool proxy starting on dns: [{}], proxy: [{}], auth: {}, prefix: {}/{}, ipv4_pass_through: {}, whitelist: {}, max_conns: {}, max_dns: {}",
         dns_str,
         proxy_str,
         if config.auth.is_some() { "enabled" } else { "disabled" },
         Ipv6Addr::from(config.prefix.network),
         config.prefix.prefix_len,
         config.ipv4_pass_through,
-        whitelist_state
+        whitelist_state,
+        config.max_conns,
+        config.max_dns
     );
 
     if !config.dns_listens.is_empty() {
@@ -1173,7 +1322,7 @@ Bind to a specific routable IP per stack.",
 
     spawn_reload_on_sighup(Arc::clone(&config))?;
 
-    let socks5_sem = Arc::new(Semaphore::new(MAX_INFLIGHT_PROXY));
+    let socks5_sem = Arc::new(Semaphore::new(config.max_conns));
 
     // Start DNS services if DNS listeners are configured.
     if !config.dns_listens.is_empty() {

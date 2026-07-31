@@ -1,0 +1,7 @@
+# Ampere Altra (Oracle Cloud aarch64) is Neoverse-N1. Tuning for it lets the
+# compiler use the full ARMv8.2-A feature set instead of the generic baseline.
+[target.aarch64-unknown-linux-musl]
+rustflags = ["-C", "target-cpu=neoverse-n1"]
+
+[target.aarch64-unknown-linux-gnu]
+rustflags = ["-C", "target-cpu=neoverse-n1"]
